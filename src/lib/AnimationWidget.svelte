@@ -16,6 +16,8 @@
 	export let animationSpeed = defaults.animationSpeed;
 	export let showOrbits = false;
 	export let resolution = 'medium';
+	/** Per juggler, by index: a rigged model to draw instead of the default figure. See ModelJuggler. */
+	export let jugglerModels = [];
 
 	let animation;
 	let paused = false;
@@ -51,7 +53,7 @@
 
 	$: animationJif = Jif.complete(jif).jif; // add missing things, TODO: show warnings
 	$: pixelRatio = { low:0.5, medium:1, high:2 }[resolution];
-	$: animationOptions = { valid, jugglingSpeed, animationSpeed, showOrbits };
+	$: animationOptions = { valid, jugglingSpeed, animationSpeed, showOrbits, jugglerModels };
 	$: sizeOptions = { width, height, pixelRatio };
 
 	const dispatch = createEventDispatcher();
@@ -66,6 +68,9 @@
 	};
 	onMount(async () => {
 		const Animation = (await import('./animation.mjs')).default; // dynamic import, only on browser
+		await Animation.loadModels(jugglerModels);
+		if (!canvas)
+			return; // destroyed while the models loaded
 
 		animation = new Animation(canvas, animationJif, animationOptions, sizeOptions);
 		loaded = true;

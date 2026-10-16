@@ -3,6 +3,8 @@ import { defaults, baseUrl } from './passist.mjs';
 import * as THREE from 'three';
 // import {OrbitControls} from "three/examples/jsm/controls/OrbitControls.js"; # this does not work (2021-05) as vite treats it as commonjs
 import { OrbitControls } from "./OrbitControls.mjs"; // <-- symlink hack to treat it like the module it actually is
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 
 const hu = 0.21;
 const jugglerHeight  = 8    * hu;
@@ -283,6 +285,18 @@ catchPosition(side)
 		);
 }
 
+zipCatchPosition(side)
+{
+	return this.throwCatchBasePosition(side)
+		.add(
+			v3(0, shoulderHeight - 2 * hu, 0)
+		).add(
+			this.facing.clone()
+			.cross(v3(0, sideFactor(side), 0))
+			.multiplyScalar(0.2)
+		);
+}
+
 setHandPosition(side, handPos)
 {
 	// calculate elbow
@@ -354,6 +368,245 @@ panic()
 
 
 } // end Juggler
+
+
+/**
+ * Models for ModelJuggler, by url: the loads, and the scenes that have arrived. A failed load resolves
+ * to null, and that juggler is drawn as a Juggler instead.
+ */
+const loadedModels = {};
+const readyModels = {};
+
+function loadModel(url)
+{
+	loadedModels[url] ??= new GLTFLoader().loadAsync(url).then(
+		gltf => readyModels[url] = gltf.scene,
+		error => {
+			console.warn('juggler model ' + url + ' did not load, drawing the default juggler', error);
+			return null;
+		}
+	);
+	return loadedModels[url];
+}
+
+// A ModelJuggler is scaled to stand this tall, whatever the model's own size: two models side by side
+// are the same height.
+const modelHeight = 1.75;
+
+/**
+ * The juggler as a rigged glTF model instead of Juggler's tubes and spheres.
+ *
+ * spec: { url, colors: { <material name>: <css color> }, label, labelColor }
+ *
+ * The model must be a skinned human facing +z with its feet at y = 0 and bones named
+ * UpperArm.{L,R}, LowerArm.{L,R}, Wrist.{L,R} and Middle2.{L,R} (the knuckle), stood in its rest pose
+ * with the arms hanging. Quaternius' characters are; see web/scripts/build-models.mjs.
+ *
+ * Juggler's hands are where its long tube arms reach, a shoulder's height up. A real arm is half as
+ * long again shorter, and could not get there, so a ModelJuggler throws and catches where its own arms
+ * hold a ball: forearms out in front, the elbows at the sides. The layout around that is Juggler's —
+ * catch on the outside, throw on the inside, a zip crossing to the middle — and setHandPosition bends
+ * the model's own bones to reach it.
+ */
+class ModelJuggler extends THREE.Group
+{
+
+constructor(source, spec)
+{
+	super();
+	const model = cloneSkinned(source);
+	source.updateMatrixWorld(true);
+	const box = new THREE.Box3().setFromObject(source);
+	model.scale.multiplyScalar(modelHeight / box.max.y);
+	this.add(model);
+
+	const colors = spec.colors || {};
+	const materials = {};
+	model.traverse(o => {
+		if (!o.isMesh)
+			return;
+		const name = o.material.name;
+		// Toon, like the props and the ground. With ColorManagement off (see Animation) a css colour is
+		// taken as linear and comes out lighter than it was picked, so it is converted here; the file's
+		// own colours are linear already.
+		materials[name] ??= new THREE.MeshToonMaterial({
+			color: colors[name] ? new THREE.Color(colors[name]).convertSRGBToLinear() : o.material.color.clone(),
+		});
+		o.material = materials[name];
+		// The bounds are the rest pose's, and an arm raised out of them would be culled with it.
+		o.frustumCulled = false;
+	});
+
+	this.updateMatrixWorld(true);
+	const at = object => object.getWorldPosition(new THREE.Vector3());
+
+	this.arms = [];
+	for (let side = 0; side < 2; side++) {
+		const suffix = side ? 'L' : 'R'; // three drops the '.' from a node name
+		const bone = name => {
+			const found = model.getObjectByName(name + suffix);
+			if (!found)
+				throw new Error('juggler model has no bone ' + name + suffix);
+			return found;
+		};
+		const upper = bone('UpperArm');
+		const lower = bone('LowerArm');
+		const wrist = bone('Wrist');
+
+		// The ball sits in the palm, part way from the wrist to the knuckle, and that is what the arm reaches with.
+		const palm = new THREE.Object3D();
+		wrist.add(palm);
+		palm.position.copy(wrist.worldToLocal(at(wrist).lerp(at(bone('Middle2')), 0.6)));
+		this.updateMatrixWorld(true);
+
+		// Hanging at the side, the palm faces the thigh.
+		const inward = v3(sideFactor(side) * -1, 0, 0);
+		const palmNormal = inward.applyQuaternion(wrist.getWorldQuaternion(new THREE.Quaternion()).invert());
+
+		this.arms.push({
+			upper, lower, wrist, palm, palmNormal,
+			rest: [upper.quaternion.clone(), lower.quaternion.clone()],
+			upperLength: at(upper).distanceTo(at(lower)),
+			lowerLength: at(lower).distanceTo(at(palm)),
+			shoulder: at(upper),
+		});
+	}
+
+	// Where the hands work, in the juggler's own frame (x to its left, z forward), from the right arm.
+	const arm = this.arms[0];
+	const reach = arm.upperLength + arm.lowerLength;
+	this.layout = {
+		width:   Math.abs(arm.shoulder.x),
+		forward: arm.shoulder.z + 0.65 * reach,
+		throwY:  arm.shoulder.y - arm.upperLength - 0.06,
+		catchY:  arm.shoulder.y - arm.upperLength + 0.14,
+		offset:  0.08,
+	};
+
+	if (spec.label)
+		this.add(ModelJuggler.labelSprite(spec.label, spec.labelColor || colors[Object.keys(colors)[0]] || '#333'));
+}
+
+static labelSprite(text, color)
+{
+	const size = 128;
+	const canvas = document.createElement('canvas');
+	canvas.width = canvas.height = size;
+	const ctx = canvas.getContext('2d');
+	ctx.fillStyle = color;
+	ctx.beginPath();
+	ctx.arc(size / 2, size / 2, size / 2 - 6, 0, 2 * Math.PI);
+	ctx.fill();
+	ctx.lineWidth = 8;
+	ctx.strokeStyle = 'white';
+	ctx.stroke();
+	ctx.fillStyle = 'white';
+	ctx.font = `bold ${size * 0.55}px sans-serif`;
+	ctx.textAlign = 'center';
+	ctx.textBaseline = 'middle';
+	ctx.fillText(text, size / 2, size / 2 + size * 0.04);
+
+	const texture = new THREE.CanvasTexture(canvas);
+	texture.colorSpace = THREE.SRGBColorSpace;
+	const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture }));
+	sprite.scale.set(0.3, 0.3, 1);
+	sprite.position.set(0, modelHeight + 0.25, 0);
+	return sprite;
+}
+
+get facing()
+{
+	return v3(0, 0, 1).applyQuaternion(this.quaternion);
+}
+
+/** A point given in the juggler's own frame, for `side`'s hand: x is towards the body's middle. */
+handPoint(side, inward, y)
+{
+	const { width, forward } = this.layout;
+	this.updateMatrixWorld();
+	return this.localToWorld(v3(sideFactor(side) * (width - inward), y, forward));
+}
+
+throwPosition(side)
+{
+	return this.handPoint(side, this.layout.offset, this.layout.throwY);
+}
+
+catchPosition(side)
+{
+	return this.handPoint(side, -this.layout.offset, this.layout.catchY);
+}
+
+zipCatchPosition(side)
+{
+	return this.handPoint(side, 2 * this.layout.offset, this.layout.throwY);
+}
+
+setHandPosition(side, handPos)
+{
+	const arm = this.arms[side];
+	arm.upper.quaternion.copy(arm.rest[0]);
+	arm.lower.quaternion.copy(arm.rest[1]);
+	this.updateMatrixWorld(true);
+
+	const shoulder = arm.upper.getWorldPosition(new THREE.Vector3());
+	const a = arm.upperLength;
+	const b = arm.lowerLength;
+
+	// Clamp to the reachable shell, so an arm that cannot get there points at it straight, as Juggler's does.
+	const toHand = handPos.clone().sub(shoulder);
+	const d = THREE.MathUtils.clamp(toHand.length(), Math.abs(a - b) + 1e-3, a + b - 1e-3);
+	const dir = toHand.normalize();
+	const target = shoulder.clone().addScaledVector(dir, d);
+
+	// The elbow, by the law of cosines, bent down and a little out, the way Juggler bends its own.
+	const along = (a * a - b * b + d * d) / (2 * d);
+	const out = Math.sqrt(Math.max(0, a * a - along * along));
+	const pole = dir.clone().cross(
+		v3(-1, 0.3 * -sideFactor(side), 0).normalize().applyQuaternion(this.quaternion)
+	).normalize();
+	const elbow = shoulder.clone().addScaledVector(dir, along).addScaledVector(pole, out);
+
+	ModelJuggler.aim(arm.upper, arm.lower.getWorldPosition(new THREE.Vector3()).sub(shoulder), elbow.clone().sub(shoulder));
+	arm.upper.updateMatrixWorld(true);
+	const elbowNow = arm.lower.getWorldPosition(new THREE.Vector3());
+	ModelJuggler.aim(arm.lower, arm.palm.getWorldPosition(new THREE.Vector3()).sub(elbowNow), target.clone().sub(elbowNow));
+	arm.lower.updateMatrixWorld(true);
+
+	// Turn the forearm about its own length until the palm faces up, under the ball.
+	const axis = target.clone().sub(elbowNow).normalize();
+	const normal = arm.palmNormal.clone()
+		.applyQuaternion(arm.wrist.getWorldQuaternion(new THREE.Quaternion()))
+		.projectOnPlane(axis);
+	const up = v3(0, 1, 0).projectOnPlane(axis);
+	if (normal.lengthSq() > 1e-6 && up.lengthSq() > 1e-6) {
+		const angle = Math.atan2(normal.clone().cross(up).dot(axis), normal.dot(up));
+		ModelJuggler.rotateWorld(arm.lower, new THREE.Quaternion().setFromAxisAngle(axis, angle));
+	}
+}
+
+/** Turn a bone so that `from`, a world direction it carries, points along `to`. */
+static aim(bone, from, to)
+{
+	ModelJuggler.rotateWorld(bone, new THREE.Quaternion().setFromUnitVectors(from.normalize(), to.normalize()));
+}
+
+/** Apply a rotation given in world space to a bone. */
+static rotateWorld(bone, rotation)
+{
+	const world = bone.getWorldQuaternion(new THREE.Quaternion());
+	const parent = bone.parent.getWorldQuaternion(new THREE.Quaternion());
+	bone.quaternion.copy(parent.invert().multiply(rotation.multiply(world)));
+}
+
+panic()
+{
+	this.updateMatrixWorld(true);
+	for (let side = 0; side < 2; side++)
+		this.setHandPosition(side, this.localToWorld(v3(sideFactor(side) * 0.35, modelHeight + 0.15, 0.1)));
+}
+
+} // end ModelJuggler
 
 
 class ThrowCurve extends THREE.Curve
@@ -580,6 +833,15 @@ constructor(canvas, jif, animationOptions, sizeOptions)
 	this.animate();
 }
 
+/**
+ * Fetch the models `jugglerModels` names. updateScene builds the scene at once and draws a Juggler for
+ * any model not yet here, so await this before the first one.
+ */
+static loadModels(jugglerModels = [])
+{
+	return Promise.all(jugglerModels.filter(Boolean).map(spec => loadModel(spec.url)));
+}
+
 resize(sizeOptions)
 {
 	const { width, height, pixelRatio } = sizeOptions;
@@ -773,8 +1035,13 @@ updateScene(jif, options)
 	this.bbox = new THREE.Box3(v3(0, 0, 0), v3(0, 0, 0));
 
 	this.jugglers = [];
-	for (const juggler of jif.jugglers) {
-		const j = new Juggler(resourceUrl(options.valid ? '/images/face_texture.png' : '/images/panic_face_texture.png'));
+	const models = options.jugglerModels || [];
+	for (const [index, juggler] of jif.jugglers.entries()) {
+		const spec = models[index];
+		const model = spec && readyModels[spec.url];
+		const j = model
+			? new ModelJuggler(model, spec)
+			: new Juggler(resourceUrl(options.valid ? '/images/face_texture.png' : '/images/panic_face_texture.png'));
 		j.position.set(...juggler.position);
 		j.lookAt(...juggler.lookAt);
 		this.jugglers.push(j);
@@ -838,51 +1105,11 @@ updateScene(jif, options)
 			side = limb.type.match(/right/) ? 0 : 1;
 		}
 
-		let sf = sideFactor(side);
-
-		let forwardDistance = lowerArmLength + handLength;
-		let sideDistance = shoudlerWidth / 2;
-		let throwCatchOffset = 0.1;
-		let jugglerPos = this.jugglers[j].position;
-
-		const facing = this.jugglers[j].facing;
-
-		let basePos = jugglerPos.clone().add(
-			facing.clone()
-			.multiplyScalar(forwardDistance)
-		).add(
-			facing.clone()
-			.cross(v3(0, -sf, 0))
-			.multiplyScalar(sideDistance)
-		);
-		const throwPosition = basePos.clone()
-			.add(
-				v3(0, shoulderHeight - 2 * hu, 0)
-			).add(
-				facing.clone()
-				.cross(v3(0, sf, 0))
-				.multiplyScalar(throwCatchOffset)
-			);
-		const catchPosition = basePos.clone()
-			.add(
-				v3(0, shoulderHeight, 0)
-			).add(
-				facing.clone()
-				.cross(v3(0, -sf, 0))
-				.multiplyScalar(throwCatchOffset)
-			);
-		this.catchPositions.push(catchPosition);
+		// Each juggler knows where its own hands work.
+		const throwPosition = this.jugglers[j].throwPosition(side);
+		this.catchPositions.push(this.jugglers[j].catchPosition(side));
 		this.throwPositions.push(throwPosition);
-		this.zipCatchPositions.push(
-			basePos.clone()
-				.add(
-					v3(0, shoulderHeight - 2 * hu, 0)
-				).add(
-					facing.clone()
-					.cross(v3(0, sf, 0))
-					.multiplyScalar(throwCatchOffset * 2)
-				)
-		);
+		this.zipCatchPositions.push(this.jugglers[j].zipCatchPosition(side));
 		this.jugglers[j].setHandPosition(side, throwPosition);
 
 		this.hands.push({
