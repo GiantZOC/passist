@@ -27,6 +27,21 @@ const colors = {
 	meeseeks: '#5fcaf6',
 };
 
+// The surroundings: Passist's own grass and teal sky, or `clean`, a plain floor under a pale sky for a
+// page where the pattern is the point. The clean floor is light and neutral with a faint metre grid,
+// kept for depth, and neither it nor the sky is so near white that a club's white handle is lost on it.
+// Its light is white rather than the sky's teal over the grass's yellow, which tints every colour.
+const sceneries = {
+	passist: {
+		sky: colors.sky, fog: colors.fog, lightSky: colors.sky, lightGround: colors.horizon,
+		ground: { kind: 'checks', colors: [colors.ground1, colors.ground2] },
+	},
+	clean: {
+		sky: '#9fc0de', fog: '#e9eef2', lightSky: '#ffffff', lightGround: '#cfcac0',
+		ground: { kind: 'grid', base: '#d9d5cc', line: '#cbc6bb' },
+	},
+};
+
 function propColor(prop, jif)
 {
 	return prop.color || (jif.defaults && jif.defaults.prop && jif.defaults.prop.color) || "white";
@@ -825,8 +840,9 @@ constructor(canvas, jif, animationOptions, sizeOptions)
 	this.timer = {dt: 0};
 	this.paused = false;
 
-	this.grassTileMesh = Animation.createGrassTileMesh();
-	this.skyMesh = Animation.createSkyMesh();
+	this.scenery = sceneries[animationOptions.scenery] || sceneries.passist;
+	this.grassTileMesh = Animation.createGroundMesh(this.scenery.ground);
+	this.skyMesh = Animation.createSkyMesh(this.scenery);
 	this.clubGeometry = pirouetteGeometry();
 
 	this.updateScene(jif, animationOptions);
@@ -889,7 +905,36 @@ positionCamera()
  * code mostly extracted from https://github.com/supermedium/aframe-environment-component
  * many thanks to the A-Frame guys!
  */
-static createGrassTileMesh()
+static createGroundMesh(ground)
+{
+	return ground.kind == 'grid' ? Animation.createGridMesh(ground) : Animation.createGrassTileMesh(ground.colors);
+}
+
+/** A plain floor ruled every metre, the lines thin enough to fade into it with distance. */
+static createGridMesh({ base, line })
+{
+	const size = 64;
+	const radius = 200;
+	const canvas = document.createElement('canvas');
+	canvas.width = canvas.height = size;
+	const ctx = canvas.getContext('2d');
+	ctx.fillStyle = base;
+	ctx.fillRect(0, 0, size, size);
+	ctx.fillStyle = line;
+	ctx.fillRect(0, 0, size, 2);
+	ctx.fillRect(0, 0, 2, size);
+	const tex = new THREE.CanvasTexture(canvas);
+	tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+	tex.repeat.set(2 * radius, 2 * radius); // a circle's uv spans its diameter: one tile a metre
+	tex.anisotropy = 8;
+	tex.colorSpace = THREE.SRGBColorSpace;
+	return new THREE.Mesh(
+		new THREE.CircleGeometry(radius, 64).rotateX(-Math.PI / 2),
+		new THREE.MeshBasicMaterial({ map: tex }),
+	);
+}
+
+static createGrassTileMesh([ground1, ground2])
 {
 	const numSquares = 32;
 	const groundStretch = 10;
@@ -901,8 +946,8 @@ static createGrassTileMesh()
 	canvas.width  = numSquares;
 	canvas.height = numSquares;
 	const ctx = canvas.getContext("2d");
-	const col1 = new THREE.Color(colors.ground1);
-	const col2 = new THREE.Color(colors.ground2);
+	const col1 = new THREE.Color(ground1);
+	const col2 = new THREE.Color(ground2);
 	for (let i = 0; i < numSquares * numSquares; i++) {
 		const col = groundRand(i + 3) > 0.5 ? col1.clone() : col2.clone();
 		col.addScalar(groundRand(i + 3) * 0.1 - 0.05);
@@ -922,14 +967,14 @@ static createGrassTileMesh()
 	);
 }
 
-static createSkyMesh()
+static createSkyMesh({ sky, fog })
 {
 	return new THREE.Mesh(
 		new THREE.SphereGeometry( 4000, 32, 15 ),
 		new THREE.ShaderMaterial({
 			uniforms: {
-				"topColor":    { value: new THREE.Color(colors.sky) },
-				"bottomColor": { value: new THREE.Color(colors.fog) },
+				"topColor":    { value: new THREE.Color(sky) },
+				"bottomColor": { value: new THREE.Color(fog) },
 				"offset":      { value: 33 },
 				"exponent":    { value: 0.6 }
 			},
@@ -1019,9 +1064,9 @@ updateScene(jif, options)
 
 	this.scene.background = new THREE.Color().setHSL(0.6, 0, 1);
 	this.scene.fog = new THREE.Fog(this.scene.background, 50, 1000);
-	this.scene.fog.color.copy( new THREE.Color(colors.fog));
+	this.scene.fog.color.copy( new THREE.Color(this.scenery.fog));
 
-	const hemiLight = new THREE.HemisphereLight(colors.sky, colors.horizon, 1);
+	const hemiLight = new THREE.HemisphereLight(this.scenery.lightSky, this.scenery.lightGround, 1);
 	hemiLight.position.set(0, 50, 0);
 	this.scene.add(hemiLight);
 

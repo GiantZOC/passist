@@ -18,6 +18,8 @@
 	export let resolution = 'medium';
 	/** Per juggler, by index: a rigged model to draw instead of the default figure. See ModelJuggler. */
 	export let jugglerModels = [];
+	/** The surroundings, fixed when the widget mounts: 'passist' (grass and a teal sky) or 'clean'. */
+	export let scenery = 'passist';
 
 	let animation;
 	let paused = false;
@@ -53,7 +55,7 @@
 
 	$: animationJif = Jif.complete(jif).jif; // add missing things, TODO: show warnings
 	$: pixelRatio = { low:0.5, medium:1, high:2 }[resolution];
-	$: animationOptions = { valid, jugglingSpeed, animationSpeed, showOrbits, jugglerModels };
+	$: animationOptions = { valid, jugglingSpeed, animationSpeed, showOrbits, jugglerModels, scenery };
 	$: sizeOptions = { width, height, pixelRatio };
 
 	const dispatch = createEventDispatcher();
@@ -220,7 +222,7 @@
 />
 
 <div bind:this={container} class=container class:isFullscreen class:isMaximized bind:clientWidth={width} bind:clientHeight={height} >
-	<div class=background />
+	<div class=background style:background-color={scenery == 'clean' ? '#e9eef2' : null} />
 	<canvas
 		bind:this={canvas}
 		class:dragging={dragStart}
