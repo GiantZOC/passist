@@ -16,6 +16,16 @@
 	export let animationSpeed = defaults.animationSpeed;
 	export let showOrbits = false;
 	export let resolution = 'medium';
+	/**
+	 * The export surface, read by an embedding page as `widget.api`.
+	 *
+	 * A prop, because the standalone bundle is built with `accessors` and a prop is the one thing an
+	 * outside constructor call can read back off the instance. It answers what the clip is (`cycles`,
+	 * `cycleDuration`) and draws one (`image`, `video`); see `Animation`.
+	 */
+	export let api = null;
+	/** The footer drawn into an exported frame: the pair being shown, e.g. `3C69B + 09C99`. */
+	export let stamp = '';
 
 	let animation;
 	let paused = false;
@@ -68,6 +78,13 @@
 		const Animation = (await import('./animation.mjs')).default; // dynamic import, only on browser
 
 		animation = new Animation(canvas, animationJif, animationOptions, sizeOptions);
+		api = {
+			cycleDuration: () => animation.cycleDuration(),
+			// Two cycles of a short loop, so the clip reads as a loop; one of a long one, so it stays short.
+			cycles: () => (animation.cycleDuration() < 3000 ? 2 : 1),
+			image: (options) => animation.snapshot({ stamp, ...options }),
+			video: (options) => animation.recordCycles({ stamp, ...options }),
+		};
 		loaded = true;
 		fpsInterval = setInterval(() => fps = animation.fps, 1000);
 
@@ -116,6 +133,7 @@
 		if (animation) {
 			animation.destroy();
 			animation = undefined;
+			api = null;
 		}
 		if (fpsInterval)
 			clearInterval(fpsInterval);

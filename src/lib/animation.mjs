@@ -1084,6 +1084,169 @@ togglePause()
 	return this.paused = !this.paused;
 }
 
+/**
+ * Play the clip's starting position, as it stands at time 0 of the loop.
+ *
+ * The loop only advances the props and the hands, so this is all a scene reset needs.
+ */
+setTime(t)
+{
+	if (this.props)
+		this.setPositions(t);
+}
+
+/**
+ * One cycle of the animation, in milliseconds of wall clock.
+ *
+ * The loop draws `time * animationSpeed % periodSeconds` of a loop that is `periodSeconds` long, and
+ * `periodSeconds` is `repetition.period / beatsPerSecond` with `beatsPerSecond` the juggling speed
+ * stretched by the JIF's own factor. Two factors, not one: a pair JIF from `Jif.complete` runs the
+ * cycle over `limbs.length / 2` beats per throw, which is what `timeStretchFactor` carries.
+ */
+cycleDuration()
+{
+	const period = this.jif && this.jif.repetition ? this.jif.repetition.period : 1;
+	return 1000 * period / (this.beatsPerSecond * this.options.animationSpeed);
+}
+
+/**
+ * The live canvas, sized for an export frame, and a handle that puts it back.
+ *
+ * Both exports share this: shrink the widget's canvas to the export size, freeze the orbit controls and
+ * the user's pause, drive the scene from a time of the export's choosing, and hand the canvas out to be
+ * copied. The live loop is cancelled for the duration, because it renders every animation frame and
+ * would overwrite the export frame between the render and the copy.
+ */
+beginExport({ width, height })
+{
+	if (this.exporting)
+	this.exporting.stop();
+
+	const canvas = this.renderer.domElement;
+	const pixelRatio = canvas.width / parseFloat(canvas.style.width) || 1;
+	const state = {
+		width: canvas.width / pixelRatio,
+		height: canvas.height / pixelRatio,
+		pixelRatio,
+		paused: this.paused,
+	};
+
+	cancelAnimationFrame(this.animationFrameRequestId);
+	this.resize({ width, height, pixelRatio: 1 });
+	this.controls.enabled = false;
+	this.paused = false;
+
+	let closed = false;
+	return {
+		canvas,
+		stop: () => {
+			if (closed) return;
+			closed = true;
+			this.resize(state);
+			this.controls.enabled = true;
+			this.paused = state.paused;
+			this.exporting = null;
+			this.setTime(this.timer.dt / 1000 * this.options.animationSpeed % this.periodSeconds);
+			this.animate(); // the live loop resumes where it was
+		},
+	};
+}
+
+/**
+ * A footer for an exported frame, so a saved clip carries what it is.
+ *
+ * Drawn on the export canvas and not in the scene: the footer belongs to the export, so the page's own
+ * animation never shows it.
+ */
+static stamp(ctx, text, width, height)
+{
+	if (!text) return;
+	const band = Math.round(height / 12);
+	ctx.font = `${Math.round(height / 24)}px sans-serif`;
+	ctx.textBaseline = 'bottom';
+	ctx.fillStyle = 'rgba(0,0,0,0.45)';
+	ctx.fillRect(0, height - band, ctx.measureText(text).width + band, band);
+	ctx.fillStyle = 'rgba(255,255,255,0.9)';
+	ctx.fillText(text, band / 2, height - band / 3);
+}
+
+/**
+ * `cycles` whole cycles as a video Blob, at the export size.
+ *
+ * Deliberately not a recording of the visible canvas: the viewer's window is whatever size it happens
+ * to be, and a phone's export should not be a phone's size. So the frames are drawn into the widget's
+ * canvas at the export size and copied into a 2D canvas of that size in the same task - the one moment
+ * a canvas with `preserveDrawingBuffer: false` is guaranteed readable - and that canvas is what the
+ * recorder sees. The scene is drawn from an explicit frame number rather than from wall-clock time, so
+ * frame N is the same animation state in every clip.
+ *
+ * The frames are fed on a wall-clock schedule, because `MediaRecorder` stamps each frame with the time
+ * it arrived: a clip is as long as the drawing of it took. A background tab throttles that schedule and
+ * the clip comes out slow, so this is a foreground-tab feature.
+ */
+async recordCycles({ cycles = 2, fps = 30, width = 960, height = 540, stamp = '', onProgress } = {})
+{
+	if (typeof MediaRecorder === 'undefined')
+	throw new Error('This browser cannot record video');
+	const type = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4']
+	.find((one) => MediaRecorder.isTypeSupported(one));
+	if (!type) throw new Error('This browser cannot record video');
+
+	const out = document.createElement('canvas');
+	out.width = width;
+	out.height = height;
+	const ctx = out.getContext('2d');
+	const recorder = new MediaRecorder(out.captureStream(fps), { mimeType: type, videoBitsPerSecond: 4_000_000 });
+	const chunks = [];
+	recorder.ondataavailable = (event) => { if (event.data.size > 0) chunks.push(event.data); };
+	const finished = new Promise((resolve, reject) => {
+		recorder.onstop = () => resolve(new Blob(chunks, { type }));
+		recorder.onerror = () => reject(recorder.error);
+	});
+
+	const export_ = this.beginExport({ width, height });
+	this.exporting = export_;
+	const perFrame = 1000 / fps;
+	const frames = Math.max(1, Math.round(cycles * this.cycleDuration() / perFrame));
+	const started = performance.now();
+	recorder.start();
+
+	for (let frame = 0; frame < frames; frame++) {
+		this.setTime(frame * perFrame / 1000 * this.options.animationSpeed % this.periodSeconds);
+		this.renderer.render(this.scene, this.camera);
+		ctx.drawImage(export_.canvas, 0, 0, width, height);
+		Animation.stamp(ctx, stamp, width, height);
+		if (onProgress) onProgress((frame + 1) / frames);
+		const wait = started + (frame + 1) * perFrame - performance.now();
+		if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+	}
+
+	recorder.stop();
+	export_.stop();
+	return finished;
+}
+
+/**
+ * The frame the animation is showing, as a canvas of the export size.
+ */
+snapshot({ width = 960, height = 540, stamp = '' } = {})
+{
+	const out = document.createElement('canvas');
+	out.width = width;
+	out.height = height;
+	const ctx = out.getContext('2d');
+
+	const export_ = this.beginExport({ width, height });
+	this.exporting = export_;
+	const time = this.timer.dt / 1000 * this.options.animationSpeed % this.periodSeconds;
+	this.setTime(time);
+	this.renderer.render(this.scene, this.camera);
+	ctx.drawImage(export_.canvas, 0, 0, width, height);
+	Animation.stamp(ctx, stamp, width, height);
+	export_.stop();
+	return out;
+}
+
 cleanup()
 {
 	if (this.scene) {
@@ -1094,6 +1257,8 @@ cleanup()
 
 destroy()
 {
+	if (this.recording)
+		this.recording.stop();
 	this.cleanup();
 	if (this.animationFrameRequestId)
 		cancelAnimationFrame(this.animationFrameRequestId);
