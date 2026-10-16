@@ -567,8 +567,8 @@ static labelSprite(text, color)
 	const texture = new THREE.CanvasTexture(canvas);
 	texture.colorSpace = THREE.SRGBColorSpace;
 	const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture }));
-	sprite.scale.set(0.3, 0.3, 1);
-	sprite.position.set(0, modelHeight + 0.25, 0);
+	sprite.scale.set(0.22, 0.22, 1);
+	sprite.position.set(0, modelHeight + 0.21, 0);
 	return sprite;
 }
 
