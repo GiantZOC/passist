@@ -103,15 +103,16 @@ function pirouetteGeometry()
 		.center();
 }
 
-function resourceUrl(url)
+/** A file of Passist's own, from passist.org unless the widget was told where else to find them. */
+function resourceUrl(url, base = baseUrl)
 {
-	return baseUrl + url;
+	return base + url;
 }
 
 class Juggler extends THREE.Group
 {
 
-constructor(faceTexture)
+constructor(faceTexture, resourceBase)
 {
 	super();
 	const pirouette = pirouetteGeometry();
@@ -132,7 +133,7 @@ constructor(faceTexture)
 		}
 	);
 	(new THREE.TextureLoader()).load(
-		resourceUrl('/images/meeseeks_blue.png'),
+		resourceUrl('/images/meeseeks_blue.png', resourceBase),
 		function( texture ) {
 			texture.encoding = THREE.sRGBEncoding;
 			bodyMaterial.map = texture;
@@ -1265,7 +1266,9 @@ updateScene(jif, options)
 		const model = spec && readyModels[spec.url];
 		const j = model
 			? new ModelJuggler(model, spec)
-			: new Juggler(resourceUrl(options.valid ? '/images/face_texture.png' : '/images/panic_face_texture.png'));
+			: new Juggler(
+				resourceUrl(options.valid ? '/images/face_texture.png' : '/images/panic_face_texture.png', options.resourceBase),
+				options.resourceBase);
 		j.position.set(...juggler.position);
 		j.lookAt(...juggler.lookAt);
 		this.jugglers.push(j);

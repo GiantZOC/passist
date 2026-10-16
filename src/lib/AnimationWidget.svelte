@@ -20,6 +20,8 @@
 	export let jugglerModels = [];
 	/** The surroundings, fixed when the widget mounts: 'passist' (grass and a teal sky) or 'clean'. */
 	export let scenery = 'passist';
+	/** Where Passist's own images are served from (`<resourceBase>/images/...`); passist.org if left out. */
+	export let resourceBase = undefined;
 
 	let animation;
 	let paused = false;
@@ -55,7 +57,7 @@
 
 	$: animationJif = Jif.complete(jif).jif; // add missing things, TODO: show warnings
 	$: pixelRatio = { low:0.5, medium:1, high:2 }[resolution];
-	$: animationOptions = { valid, jugglingSpeed, animationSpeed, showOrbits, jugglerModels, scenery };
+	$: animationOptions = { valid, jugglingSpeed, animationSpeed, showOrbits, jugglerModels, scenery, resourceBase };
 	$: sizeOptions = { width, height, pixelRatio };
 
 	const dispatch = createEventDispatcher();
