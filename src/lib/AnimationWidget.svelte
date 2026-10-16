@@ -82,7 +82,13 @@
 			cycleDuration: () => animation.cycleDuration(),
 			// Two cycles of a short loop, so the clip reads as a loop; one of a long one, so it stays short.
 			cycles: () => (animation.cycleDuration() < 3000 ? 2 : 1),
-			image: (options) => animation.snapshot({ stamp, ...options }),
+			// The page shares a file, not a canvas: the snapshot is encoded here.
+			image: (options) => new Promise((resolve, reject) => {
+				animation.snapshot({ stamp, ...options }).toBlob(
+					(blob) => (blob ? resolve(blob) : reject(new Error('The image could not be encoded'))),
+					'image/png',
+				);
+			}),
 			video: (options) => animation.recordCycles({ stamp, ...options }),
 		};
 		loaded = true;
