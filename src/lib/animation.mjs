@@ -3,6 +3,8 @@ import { defaults, baseUrl } from './passist.mjs';
 import * as THREE from 'three';
 // import {OrbitControls} from "three/examples/jsm/controls/OrbitControls.js"; # this does not work (2021-05) as vite treats it as commonjs
 import { OrbitControls } from "./OrbitControls.mjs"; // <-- symlink hack to treat it like the module it actually is
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 
 const hu = 0.21;
 const jugglerHeight  = 8    * hu;
@@ -23,6 +25,21 @@ const colors = {
 	ground1: '#937a24',
 	ground2: '#987d2e',
 	meeseeks: '#5fcaf6',
+};
+
+// The surroundings: Passist's own grass and teal sky, or `clean`, a plain floor under a pale sky for a
+// page where the pattern is the point. The clean floor is light and neutral with a faint metre grid,
+// kept for depth, and neither it nor the sky is so near white that a club's white handle is lost on it.
+// Its light is white rather than the sky's teal over the grass's yellow, which tints every colour.
+const sceneries = {
+	passist: {
+		sky: colors.sky, fog: colors.fog, lightSky: colors.sky, lightGround: colors.horizon,
+		ground: { kind: 'checks', colors: [colors.ground1, colors.ground2] },
+	},
+	clean: {
+		sky: '#9fc0de', fog: '#e9eef2', lightSky: '#ffffff', lightGround: '#cfcac0',
+		ground: { kind: 'grid', base: '#d9d5cc', line: '#cbc6bb' },
+	},
 };
 
 function propColor(prop, jif)
@@ -86,15 +103,16 @@ function pirouetteGeometry()
 		.center();
 }
 
-function resourceUrl(url)
+/** A file of Passist's own, from passist.org unless the widget was told where else to find them. */
+function resourceUrl(url, base = baseUrl)
 {
-	return baseUrl + url;
+	return base + url;
 }
 
 class Juggler extends THREE.Group
 {
 
-constructor(faceTexture)
+constructor(faceTexture, resourceBase)
 {
 	super();
 	const pirouette = pirouetteGeometry();
@@ -115,7 +133,7 @@ constructor(faceTexture)
 		}
 	);
 	(new THREE.TextureLoader()).load(
-		resourceUrl('/images/meeseeks_blue.png'),
+		resourceUrl('/images/meeseeks_blue.png', resourceBase),
 		function( texture ) {
 			texture.encoding = THREE.sRGBEncoding;
 			bodyMaterial.map = texture;
@@ -283,6 +301,18 @@ catchPosition(side)
 		);
 }
 
+zipCatchPosition(side)
+{
+	return this.throwCatchBasePosition(side)
+		.add(
+			v3(0, shoulderHeight - 2 * hu, 0)
+		).add(
+			this.facing.clone()
+			.cross(v3(0, sideFactor(side), 0))
+			.multiplyScalar(0.2)
+		);
+}
+
 setHandPosition(side, handPos)
 {
 	// calculate elbow
@@ -354,6 +384,424 @@ panic()
 
 
 } // end Juggler
+
+
+/**
+ * Models for ModelJuggler, by url: the loads, and the scenes that have arrived. A failed load resolves
+ * to null, and that juggler is drawn as a Juggler instead.
+ */
+const loadedModels = {};
+const readyModels = {};
+
+function loadModel(url)
+{
+	loadedModels[url] ??= new GLTFLoader().loadAsync(url).then(
+		gltf => readyModels[url] = gltf.scene,
+		error => {
+			console.warn('juggler model ' + url + ' did not load, drawing the default juggler', error);
+			return null;
+		}
+	);
+	return loadedModels[url];
+}
+
+// Where a club is held: this far down its axis from its middle, on the handle (the knob is at -0.26).
+const clubGrip = 0.16;
+// How long the fingers take to close round a club caught, and to open after one is thrown, seconds.
+const gripCloseSeconds = 0.08;
+const gripOpenSeconds = 0.1;
+// How long an empty hand takes to relax after a throw, and to turn to the next club before a catch.
+const gripReadySeconds = 0.12;
+// The angle a gripping juggler lets go of a club at, about the throw's spin axis: Passist's 1.5 pi
+// is level and pointing where it goes, 2 pi upright; this is half way.
+const gripReleaseAngle = 1.75 * Math.PI;
+// A handle's centre, out from the palm, metres: its radius and the palm's own flesh.
+const gripDepth = 0.03;
+// How far each finger joint turns to close round a handle, knuckle first, and the thumb's two, radians.
+const fingerCurl = [1.05, 1.3, 0.8];
+const thumbCurl = [0.5, 0.6];
+// The furthest a wrist bends from straight, radians.
+const maxWristBend = 1.2;
+
+// A ModelJuggler is scaled to stand this tall, whatever the model's own size: two models side by side
+// are the same height.
+const modelHeight = 1.75;
+
+/**
+ * The juggler as a rigged glTF model instead of Juggler's tubes and spheres.
+ *
+ * spec: { url, colors: { <material name>: <css color> }, label, labelColor }
+ *
+ * The model must be a skinned human facing +z with its feet at y = 0 and bones named
+ * UpperArm.{L,R}, LowerArm.{L,R}, Wrist.{L,R} and Middle2.{L,R} (the knuckle), stood in its rest pose
+ * with the arms hanging. Quaternius' characters are; see web/scripts/build-models.mjs.
+ *
+ * Juggler's hands are where its long tube arms reach, a shoulder's height up. A real arm is half as
+ * long again shorter, and could not get there, so a ModelJuggler throws and catches where its own arms
+ * hold a ball: forearms out in front, the elbows at the sides. The layout around that is Juggler's —
+ * catch on the outside, throw on the inside, a zip crossing to the middle — and setHandPosition bends
+ * the model's own bones to reach it.
+ */
+class ModelJuggler extends THREE.Group
+{
+
+/** A ModelJuggler grips what it holds; Animation works out where (holdAt) only for a juggler that does. */
+get grips()
+{
+	return true;
+}
+
+constructor(source, spec)
+{
+	super();
+	const model = cloneSkinned(source);
+	source.updateMatrixWorld(true);
+	const box = new THREE.Box3().setFromObject(source);
+	model.scale.multiplyScalar(modelHeight / box.max.y);
+	this.add(model);
+
+	const colors = spec.colors || {};
+	const materials = {};
+	model.traverse(o => {
+		if (!o.isMesh)
+			return;
+		const name = o.material.name;
+		// Toon, like the props and the ground. With ColorManagement off (see Animation) a css colour is
+		// taken as linear and comes out lighter than it was picked, so it is converted here; the file's
+		// own colours are linear already.
+		materials[name] ??= new THREE.MeshToonMaterial({
+			color: colors[name] ? new THREE.Color(colors[name]).convertSRGBToLinear() : o.material.color.clone(),
+		});
+		o.material = materials[name];
+		// The bounds are the rest pose's, and an arm raised out of them would be culled with it.
+		o.frustumCulled = false;
+	});
+
+	this.updateMatrixWorld(true);
+	const at = object => object.getWorldPosition(new THREE.Vector3());
+
+	this.arms = [];
+	for (let side = 0; side < 2; side++) {
+		const suffix = side ? 'L' : 'R'; // three drops the '.' from a node name
+		const bone = name => {
+			const found = model.getObjectByName(name + suffix);
+			if (!found)
+				throw new Error('juggler model has no bone ' + name + suffix);
+			return found;
+		};
+		const upper = bone('UpperArm');
+		const lower = bone('LowerArm');
+		const wrist = bone('Wrist');
+		const fingers = ['Index', 'Middle', 'Ring', 'Pinky'].flatMap(name => [2, 3, 4].map(k => bone(name + k)));
+		const thumb = [2, 3].map(k => bone('Thumb' + k));
+
+		// A ball sits in the palm, part way from the wrist to the knuckle, and that is what the arm reaches with
+		// when there is nothing to grip.
+		const palm = new THREE.Object3D();
+		wrist.add(palm);
+		palm.position.copy(wrist.worldToLocal(at(wrist).lerp(at(bone('Middle2')), 0.6)));
+		this.updateMatrixWorld(true);
+
+		// The hand's own frame, as directions in the wrist's: along the fingers, across the knuckles from the
+		// little finger to the index, and out of the palm. Hanging at the side, the palm faces the thigh.
+		const fromWorld = wrist.getWorldQuaternion(new THREE.Quaternion()).invert();
+		const along = at(bone('Middle2')).sub(at(wrist)).normalize();
+		const across = at(bone('Index2')).sub(at(bone('Pinky2'))).projectOnPlane(along).normalize();
+		const normal = along.clone().cross(across);
+		if (normal.x * sideFactor(side) > 0) // pointing out, away from the thigh
+			normal.negate();
+
+		// A handle lies across the palm inside the closed fingers.
+		const gripCentre = at(palm).addScaledVector(normal, gripDepth);
+
+		const rest = [upper, lower, wrist, ...fingers, ...thumb].map(one => one.quaternion.clone());
+		this.arms.push({
+			upper, lower, wrist, palm, fingers, thumb, rest,
+			frame: [along, across, normal].map(one => one.clone().applyQuaternion(fromWorld)),
+			handedness: Math.sign(along.clone().cross(across).dot(normal)),
+			gripOffset: gripCentre.clone().sub(at(wrist)).applyQuaternion(fromWorld),
+			fingerAxis: ModelJuggler.curlAxis(this, fingers.slice(3, 6), bone('Middle4'), gripCentre),
+			thumbAxis: ModelJuggler.curlAxis(this, thumb, bone('Thumb3'), gripCentre),
+			upperLength: at(upper).distanceTo(at(lower)),
+			lowerLength: at(lower).distanceTo(at(palm)),
+			wristLength: at(lower).distanceTo(at(wrist)),
+			shoulder: at(upper),
+		});
+	}
+
+	// Where the hands work, in the juggler's own frame (x to its left, z forward), from the right arm.
+	const arm = this.arms[0];
+	const reach = arm.upperLength + arm.lowerLength;
+	this.layout = {
+		width:   Math.abs(arm.shoulder.x),
+		forward: arm.shoulder.z + 0.65 * reach,
+		throwY:  arm.shoulder.y - arm.upperLength - 0.06,
+		catchY:  arm.shoulder.y - arm.upperLength + 0.14,
+		offset:  0.08,
+		top:     arm.shoulder.y,
+		bottom:  0.45 * arm.shoulder.y, // the hips' height, roughly: below it the legs are narrower
+	};
+
+	if (spec.label)
+		this.add(ModelJuggler.labelSprite(spec.label, spec.labelColor || colors[Object.keys(colors)[0]] || '#333'));
+}
+
+static labelSprite(text, color)
+{
+	const size = 128;
+	const canvas = document.createElement('canvas');
+	canvas.width = canvas.height = size;
+	const ctx = canvas.getContext('2d');
+	ctx.fillStyle = color;
+	ctx.beginPath();
+	ctx.arc(size / 2, size / 2, size / 2 - 6, 0, 2 * Math.PI);
+	ctx.fill();
+	ctx.lineWidth = 8;
+	ctx.strokeStyle = 'white';
+	ctx.stroke();
+	ctx.fillStyle = 'white';
+	ctx.font = `bold ${size * 0.55}px sans-serif`;
+	ctx.textAlign = 'center';
+	ctx.textBaseline = 'middle';
+	ctx.fillText(text, size / 2, size / 2 + size * 0.04);
+
+	const texture = new THREE.CanvasTexture(canvas);
+	texture.colorSpace = THREE.SRGBColorSpace;
+	const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture }));
+	sprite.scale.set(0.22, 0.22, 1);
+	sprite.position.set(0, modelHeight + 0.21, 0);
+	return sprite;
+}
+
+get facing()
+{
+	return v3(0, 0, 1).applyQuaternion(this.quaternion);
+}
+
+/**
+ * A hand position moved, if it has to be, out of the body: the torso and hips as an upright elliptic
+ * cylinder, from the hips' height to the shoulders', and a point inside it pushed straight out sideways
+ * and back to its edge, the way an arm swings past a hip rather than through it.
+ */
+clearOfBody(position)
+{
+	const { width, top, bottom } = this.layout;
+	this.updateMatrixWorld();
+	const local = this.worldToLocal(position.clone());
+	if (local.y > top || local.y < bottom)
+		return position;
+	const rx = width + 0.07;
+	const rz = 0.16;
+	const inside = Math.hypot(local.x / rx, local.z / rz);
+	if (inside >= 1)
+		return position;
+	if (inside < 1e-6)
+		local.z = rz;
+	else
+		local.multiply(v3(1 / inside, 1, 1 / inside));
+	return this.localToWorld(local);
+}
+
+/** A point given in the juggler's own frame, for `side`'s hand: x is towards the body's middle. */
+handPoint(side, inward, y)
+{
+	const { width, forward } = this.layout;
+	this.updateMatrixWorld();
+	return this.localToWorld(v3(sideFactor(side) * (width - inward), y, forward));
+}
+
+throwPosition(side)
+{
+	return this.handPoint(side, this.layout.offset, this.layout.throwY);
+}
+
+catchPosition(side)
+{
+	return this.handPoint(side, -this.layout.offset, this.layout.catchY);
+}
+
+zipCatchPosition(side)
+{
+	return this.handPoint(side, 2 * this.layout.offset, this.layout.throwY);
+}
+
+/**
+ * Which way, about one of its own axes, a finger's joints turn to close the hand: the one that brings
+ * its tip nearest the handle. A rig's bone axes are its own, and mirrored between the hands.
+ */
+static curlAxis(juggler, bones, tip, goal)
+{
+	const rest = bones.map(one => one.quaternion.clone());
+	let best, nearest = Infinity;
+	for (const axis of [v3(1, 0, 0), v3(-1, 0, 0), v3(0, 1, 0), v3(0, -1, 0), v3(0, 0, 1), v3(0, 0, -1)]) {
+		const turn = new THREE.Quaternion().setFromAxisAngle(axis, 0.9);
+		bones.forEach((one, i) => one.quaternion.copy(rest[i]).multiply(turn));
+		juggler.updateMatrixWorld(true);
+		const distance = tip.getWorldPosition(new THREE.Vector3()).distanceTo(goal);
+		if (distance < nearest) {
+			nearest = distance;
+			best = axis;
+		}
+	}
+	bones.forEach((one, i) => one.quaternion.copy(rest[i]));
+	juggler.updateMatrixWorld(true);
+	return best;
+}
+
+/**
+ * Put `side`'s hand at handPos. Given `hold` — what Animation.holdAt says the hand has — the hand takes
+ * the club by its handle: turned so the handle lies across the palm with the club's head out past the
+ * index finger, the wrist placed so the handle sits inside the fingers, and the fingers closed round
+ * it as far as `hold.closure` says. Without one (the start, and panic) the palm is put there, facing up.
+ */
+setHandPosition(side, handPos, hold)
+{
+	const arm = this.arms[side];
+	const bones = [arm.upper, arm.lower, arm.wrist, ...arm.fingers, ...arm.thumb];
+	bones.forEach((one, i) => one.quaternion.copy(arm.rest[i]));
+	this.updateMatrixWorld(true);
+	this.reach(arm, side, handPos, arm.palm, arm.lowerLength);
+
+	if (!hold) {
+		const elbow = arm.lower.getWorldPosition(new THREE.Vector3());
+		this.twist(arm, handPos.clone().sub(elbow).normalize(), v3(0, 1, 0));
+		return;
+	}
+
+	// The hand turned to what it holds, from where the forearm points when the palm reaches for it.
+	const elbow = arm.lower.getWorldPosition(new THREE.Vector3());
+	const forearmDir = arm.palm.getWorldPosition(new THREE.Vector3()).sub(elbow).normalize();
+	const hand = this.handRotation(arm, side, forearmDir, hold);
+	if (hold.ready > 0)
+		hand.slerp(this.handRotation(arm, side, forearmDir, {}), hold.ready);
+
+	// Again, now reaching with the wrist for where it must be to put the handle in that hand.
+	arm.upper.quaternion.copy(arm.rest[0]);
+	arm.lower.quaternion.copy(arm.rest[1]);
+	this.updateMatrixWorld(true);
+	const wristTarget = handPos.clone().sub(arm.gripOffset.clone().applyQuaternion(hand));
+	this.reach(arm, side, wristTarget, arm.wrist, arm.wristLength);
+
+	// The forearm takes the turn about its own length, so the wrist only has to bend.
+	const forearm = arm.wrist.getWorldPosition(new THREE.Vector3()).sub(arm.lower.getWorldPosition(new THREE.Vector3())).normalize();
+	this.twist(arm, forearm, arm.frame[2].clone().applyQuaternion(hand));
+
+	// The wrist turned the rest of the way, but no further than a wrist bends.
+	const parent = arm.wrist.parent.getWorldQuaternion(new THREE.Quaternion()).invert();
+	const local = parent.multiply(hand);
+	const bend = 2 * Math.acos(Math.min(1, Math.abs(arm.rest[2].dot(local))));
+	arm.wrist.quaternion.copy(arm.rest[2]).slerp(local, bend > maxWristBend ? maxWristBend / bend : 1);
+
+	// The fingers round the handle; round a ball, only cupped.
+	const closure = hold.closure * (hold.ball ? 0.4 : 1);
+	arm.fingers.forEach((one, i) => one.quaternion.copy(arm.rest[3 + i])
+		.multiply(new THREE.Quaternion().setFromAxisAngle(arm.fingerAxis, closure * fingerCurl[i % 3])));
+	arm.thumb.forEach((one, i) => one.quaternion.copy(arm.rest[3 + arm.fingers.length + i])
+		.multiply(new THREE.Quaternion().setFromAxisAngle(arm.thumbAxis, closure * thumbCurl[i])));
+}
+
+/**
+ * The wrist's world rotation that turns the hand's frame to what it holds: a club across the palm with
+ * its head out past the index finger, and the fingers carrying on from the forearm as nearly as that
+ * allows. Holding nothing, or a ball, the palm is open and up, turned a little in.
+ */
+handRotation(arm, side, forearm, hold)
+{
+	const [alongRest, acrossRest, normalRest] = arm.frame;
+	const h = arm.handedness;
+	const down = v3(0, -1, 0);
+	let along, across, normal;
+	if (hold.rotation && !hold.ball) {
+		across = v3(0, 1, 0).applyQuaternion(hold.rotation);
+		// The forearm's own direction across the club, leaning on straight down as the two come into line,
+		// where the forearm alone says nothing and the hand would flip.
+		const fromForearm = forearm.clone().projectOnPlane(across);
+		const sure = Math.min(1, fromForearm.length() / 0.5);
+		along = fromForearm.normalize().multiplyScalar(sure)
+			.add(down.clone().projectOnPlane(across).normalize().multiplyScalar(1 - sure));
+		if (along.lengthSq() < 1e-6)
+			along = this.facing.projectOnPlane(across);
+		along.normalize();
+		normal = along.clone().cross(across).multiplyScalar(h);
+	} else {
+		const inward = v3(-sideFactor(side), 0, 0).applyQuaternion(this.quaternion);
+		normal = v3(0, 1, 0).addScaledVector(inward, 0.5).normalize();
+		along = forearm.clone().projectOnPlane(normal);
+		if (along.lengthSq() < 1e-4)
+			along = this.facing.projectOnPlane(normal);
+		along.normalize();
+		across = normal.clone().cross(along).multiplyScalar(h);
+	}
+	const target = new THREE.Matrix4().makeBasis(along, across, normal);
+	const rest = new THREE.Matrix4().makeBasis(alongRest, acrossRest, normalRest).transpose();
+	return new THREE.Quaternion().setFromRotationMatrix(target.multiply(rest));
+}
+
+/**
+ * Bend the arm so that `effector`, carried by the forearm `lowerLength` from the elbow, reaches target:
+ * the elbow by the law of cosines, bent down and a little out the way Juggler bends its own. A target
+ * out of reach is pointed at straight, as Juggler's are.
+ */
+reach(arm, side, target, effector, lowerLength)
+{
+	const shoulder = arm.upper.getWorldPosition(new THREE.Vector3());
+	const a = arm.upperLength;
+	const b = lowerLength;
+	const toHand = target.clone().sub(shoulder);
+	const d = THREE.MathUtils.clamp(toHand.length(), Math.abs(a - b) + 1e-3, a + b - 1e-3);
+	const dir = toHand.normalize();
+	const reached = shoulder.clone().addScaledVector(dir, d);
+
+	const along = (a * a - b * b + d * d) / (2 * d);
+	const out = Math.sqrt(Math.max(0, a * a - along * along));
+	const pole = dir.clone().cross(
+		v3(-1, 0.3 * -sideFactor(side), 0).normalize().applyQuaternion(this.quaternion)
+	).normalize();
+	const elbow = shoulder.clone().addScaledVector(dir, along).addScaledVector(pole, out);
+
+	ModelJuggler.aim(arm.upper, arm.lower.getWorldPosition(new THREE.Vector3()).sub(shoulder), elbow.clone().sub(shoulder));
+	arm.upper.updateMatrixWorld(true);
+	const elbowNow = arm.lower.getWorldPosition(new THREE.Vector3());
+	ModelJuggler.aim(arm.lower, effector.getWorldPosition(new THREE.Vector3()).sub(elbowNow), reached.sub(elbowNow));
+	arm.lower.updateMatrixWorld(true);
+}
+
+/** Turn the forearm about `axis`, its own length, until the palm faces as near `toward` as it can. */
+twist(arm, axis, toward)
+{
+	const normal = arm.frame[2].clone()
+		.applyQuaternion(arm.wrist.getWorldQuaternion(new THREE.Quaternion()))
+		.projectOnPlane(axis);
+	const goal = toward.clone().projectOnPlane(axis);
+	if (normal.lengthSq() < 1e-6 || goal.lengthSq() < 1e-6)
+		return;
+	const angle = Math.atan2(normal.clone().cross(goal).dot(axis), normal.dot(goal));
+	ModelJuggler.rotateWorld(arm.lower, new THREE.Quaternion().setFromAxisAngle(axis, angle));
+	arm.lower.updateMatrixWorld(true);
+}
+
+/** Turn a bone so that `from`, a world direction it carries, points along `to`. */
+static aim(bone, from, to)
+{
+	ModelJuggler.rotateWorld(bone, new THREE.Quaternion().setFromUnitVectors(from.normalize(), to.normalize()));
+}
+
+/** Apply a rotation given in world space to a bone. */
+static rotateWorld(bone, rotation)
+{
+	const world = bone.getWorldQuaternion(new THREE.Quaternion());
+	const parent = bone.parent.getWorldQuaternion(new THREE.Quaternion());
+	bone.quaternion.copy(parent.invert().multiply(rotation.multiply(world)));
+}
+
+panic()
+{
+	this.updateMatrixWorld(true);
+	for (let side = 0; side < 2; side++)
+		this.setHandPosition(side, this.localToWorld(v3(sideFactor(side) * 0.35, modelHeight + 0.15, 0.1)));
+}
+
+} // end ModelJuggler
 
 
 class ThrowCurve extends THREE.Curve
@@ -572,12 +1020,22 @@ constructor(canvas, jif, animationOptions, sizeOptions)
 	this.timer = {dt: 0};
 	this.paused = false;
 
-	this.grassTileMesh = Animation.createGrassTileMesh();
-	this.skyMesh = Animation.createSkyMesh();
+	this.scenery = sceneries[animationOptions.scenery] || sceneries.passist;
+	this.grassTileMesh = Animation.createGroundMesh(this.scenery.ground);
+	this.skyMesh = Animation.createSkyMesh(this.scenery);
 	this.clubGeometry = pirouetteGeometry();
 
 	this.updateScene(jif, animationOptions);
 	this.animate();
+}
+
+/**
+ * Fetch the models `jugglerModels` names. updateScene builds the scene at once and draws a Juggler for
+ * any model not yet here, so await this before the first one.
+ */
+static loadModels(jugglerModels = [])
+{
+	return Promise.all(jugglerModels.filter(Boolean).map(spec => loadModel(spec.url)));
 }
 
 resize(sizeOptions)
@@ -627,7 +1085,36 @@ positionCamera()
  * code mostly extracted from https://github.com/supermedium/aframe-environment-component
  * many thanks to the A-Frame guys!
  */
-static createGrassTileMesh()
+static createGroundMesh(ground)
+{
+	return ground.kind == 'grid' ? Animation.createGridMesh(ground) : Animation.createGrassTileMesh(ground.colors);
+}
+
+/** A plain floor ruled every metre, the lines thin enough to fade into it with distance. */
+static createGridMesh({ base, line })
+{
+	const size = 64;
+	const radius = 200;
+	const canvas = document.createElement('canvas');
+	canvas.width = canvas.height = size;
+	const ctx = canvas.getContext('2d');
+	ctx.fillStyle = base;
+	ctx.fillRect(0, 0, size, size);
+	ctx.fillStyle = line;
+	ctx.fillRect(0, 0, size, 2);
+	ctx.fillRect(0, 0, 2, size);
+	const tex = new THREE.CanvasTexture(canvas);
+	tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+	tex.repeat.set(2 * radius, 2 * radius); // a circle's uv spans its diameter: one tile a metre
+	tex.anisotropy = 8;
+	tex.colorSpace = THREE.SRGBColorSpace;
+	return new THREE.Mesh(
+		new THREE.CircleGeometry(radius, 64).rotateX(-Math.PI / 2),
+		new THREE.MeshBasicMaterial({ map: tex }),
+	);
+}
+
+static createGrassTileMesh([ground1, ground2])
 {
 	const numSquares = 32;
 	const groundStretch = 10;
@@ -639,8 +1126,8 @@ static createGrassTileMesh()
 	canvas.width  = numSquares;
 	canvas.height = numSquares;
 	const ctx = canvas.getContext("2d");
-	const col1 = new THREE.Color(colors.ground1);
-	const col2 = new THREE.Color(colors.ground2);
+	const col1 = new THREE.Color(ground1);
+	const col2 = new THREE.Color(ground2);
 	for (let i = 0; i < numSquares * numSquares; i++) {
 		const col = groundRand(i + 3) > 0.5 ? col1.clone() : col2.clone();
 		col.addScalar(groundRand(i + 3) * 0.1 - 0.05);
@@ -660,14 +1147,14 @@ static createGrassTileMesh()
 	);
 }
 
-static createSkyMesh()
+static createSkyMesh({ sky, fog })
 {
 	return new THREE.Mesh(
 		new THREE.SphereGeometry( 4000, 32, 15 ),
 		new THREE.ShaderMaterial({
 			uniforms: {
-				"topColor":    { value: new THREE.Color(colors.sky) },
-				"bottomColor": { value: new THREE.Color(colors.fog) },
+				"topColor":    { value: new THREE.Color(sky) },
+				"bottomColor": { value: new THREE.Color(fog) },
 				"offset":      { value: 33 },
 				"exponent":    { value: 0.6 }
 			},
@@ -757,9 +1244,9 @@ updateScene(jif, options)
 
 	this.scene.background = new THREE.Color().setHSL(0.6, 0, 1);
 	this.scene.fog = new THREE.Fog(this.scene.background, 50, 1000);
-	this.scene.fog.color.copy( new THREE.Color(colors.fog));
+	this.scene.fog.color.copy( new THREE.Color(this.scenery.fog));
 
-	const hemiLight = new THREE.HemisphereLight(colors.sky, colors.horizon, 1);
+	const hemiLight = new THREE.HemisphereLight(this.scenery.lightSky, this.scenery.lightGround, 1);
 	hemiLight.position.set(0, 50, 0);
 	this.scene.add(hemiLight);
 
@@ -773,8 +1260,15 @@ updateScene(jif, options)
 	this.bbox = new THREE.Box3(v3(0, 0, 0), v3(0, 0, 0));
 
 	this.jugglers = [];
-	for (const juggler of jif.jugglers) {
-		const j = new Juggler(resourceUrl(options.valid ? '/images/face_texture.png' : '/images/panic_face_texture.png'));
+	const models = options.jugglerModels || [];
+	for (const [index, juggler] of jif.jugglers.entries()) {
+		const spec = models[index];
+		const model = spec && readyModels[spec.url];
+		const j = model
+			? new ModelJuggler(model, spec)
+			: new Juggler(
+				resourceUrl(options.valid ? '/images/face_texture.png' : '/images/panic_face_texture.png', options.resourceBase),
+				options.resourceBase);
 		j.position.set(...juggler.position);
 		j.lookAt(...juggler.lookAt);
 		this.jugglers.push(j);
@@ -813,6 +1307,7 @@ updateScene(jif, options)
 			);
 		this.props.push({
 			mesh: mesh,
+			type: type,
 			throws: []
 		});
 		this.scene.add(mesh);
@@ -838,51 +1333,11 @@ updateScene(jif, options)
 			side = limb.type.match(/right/) ? 0 : 1;
 		}
 
-		let sf = sideFactor(side);
-
-		let forwardDistance = lowerArmLength + handLength;
-		let sideDistance = shoudlerWidth / 2;
-		let throwCatchOffset = 0.1;
-		let jugglerPos = this.jugglers[j].position;
-
-		const facing = this.jugglers[j].facing;
-
-		let basePos = jugglerPos.clone().add(
-			facing.clone()
-			.multiplyScalar(forwardDistance)
-		).add(
-			facing.clone()
-			.cross(v3(0, -sf, 0))
-			.multiplyScalar(sideDistance)
-		);
-		const throwPosition = basePos.clone()
-			.add(
-				v3(0, shoulderHeight - 2 * hu, 0)
-			).add(
-				facing.clone()
-				.cross(v3(0, sf, 0))
-				.multiplyScalar(throwCatchOffset)
-			);
-		const catchPosition = basePos.clone()
-			.add(
-				v3(0, shoulderHeight, 0)
-			).add(
-				facing.clone()
-				.cross(v3(0, -sf, 0))
-				.multiplyScalar(throwCatchOffset)
-			);
-		this.catchPositions.push(catchPosition);
+		// Each juggler knows where its own hands work.
+		const throwPosition = this.jugglers[j].throwPosition(side);
+		this.catchPositions.push(this.jugglers[j].catchPosition(side));
 		this.throwPositions.push(throwPosition);
-		this.zipCatchPositions.push(
-			basePos.clone()
-				.add(
-					v3(0, shoulderHeight - 2 * hu, 0)
-				).add(
-					facing.clone()
-					.cross(v3(0, sf, 0))
-					.multiplyScalar(throwCatchOffset * 2)
-				)
-		);
+		this.zipCatchPositions.push(this.jugglers[j].zipCatchPosition(side));
 		this.jugglers[j].setHandPosition(side, throwPosition);
 
 		this.hands.push({
@@ -919,6 +1374,22 @@ updateScene(jif, options)
 			} else { // pass
 				t.axis = t.catchPos.clone().sub(t.throwPos).normalize().cross(up);
 				t.catchAngle = 2 * Math.PI;
+			}
+			// A juggler that grips holds a club by its handle, so the club's middle — what flies — leaves
+			// and arrives a handle's length from the hand, along the club as it lies at that moment. It
+			// lets go of the club pointing up and forward, not level: level, the club lies along the
+			// forearm, which a hand can only hold with its wrist bent square. A self is caught the same way.
+			if (t.prop !== undefined && this.props[t.prop].type != 'ball') {
+				if (this.jugglers[jugglerFrom].grips)
+					t.throwAngle = gripReleaseAngle;
+				if (this.jugglers[jugglerTo].grips && jugglerFrom == jugglerTo)
+					t.catchAngle = gripReleaseAngle;
+				const gripped = (pos, angle) => pos.clone().add(
+					v3(0, clubGrip, 0).applyQuaternion(new THREE.Quaternion().setFromAxisAngle(t.axis, angle)));
+				if (this.jugglers[jugglerFrom].grips)
+					t.throwPos = gripped(t.throwPos, t.throwAngle);
+				if (this.jugglers[jugglerTo].grips)
+					t.catchPos = gripped(t.catchPos, t.catchAngle);
 			}
 			t.throwCurve = new ThrowCurve({
 				throwPos: t.throwPos,
@@ -970,6 +1441,7 @@ updateScene(jif, options)
 					start: start,
 					duration: dwellDuration,
 					hand: curve.from,
+					prop: prop,
 					catchAxis: last.spinAxis.clone().multiplyScalar(last.isSelf ? 1 : -1),
 					catchAngle: last.catchAngle,
 					catchRotationSpeed: -last.rotationSpeed,
@@ -1006,6 +1478,8 @@ updateScene(jif, options)
 			pc.push(new LinearCurve({
 				fromPoint: last.throwPos,
 				toPoint: curve.catchPos,
+				before: last, // the dwells either side, for a ModelJuggler's grip
+				after: curve,
 				start: start,
 				duration: end - start + (end > start ? 0 : periodSeconds),
 			}));
@@ -1071,10 +1545,72 @@ setPositions(t)
 	}
 
 	for (const hand of this.hands) {
+		if (hand.juggler.grips) {
+			const hold = this.holdAt(hand, t);
+			if (!hold)
+				continue;
+			// Passist's scoop swings a club down past the hip; a body in the way moves the hand round it,
+			// and the club it holds with it.
+			const clear = hand.juggler.clearOfBody(hold.position);
+			if (hold.prop !== undefined)
+				this.props[hold.prop].mesh.position.add(clear.clone().sub(hold.position));
+			hold.position = clear;
+			hand.juggler.setHandPosition(hand.side, hold.position, hold);
+			continue;
+		}
 		const handPos = hand.movement.getPosition(t);
 		if (handPos)
 			hand.juggler.setHandPosition(hand.side, handPos);
 	}
+}
+
+/**
+ * Where a hand that grips holds what it holds at time t, for a ModelJuggler: the club by its handle
+ * rather than its middle, which is where Passist moves a hand, and the way the club points, so the
+ * hand can turn to it. The club's own path was moved out by the handle's length in updateScene, so at
+ * a catch and a throw this is the hand's own position. Between a throw and the next catch the empty hand moves from where the last
+ * handle left it to where the next will arrive, so it never jumps. `closure` is how far the fingers
+ * are closed: shut over the first moments of a dwell and open again just after the throw.
+ */
+holdAt(hand, t)
+{
+	const cf = hand.movement.getCurveAndFraction(t);
+	if (!cf)
+		return undefined;
+	const { curve, fraction } = cf;
+	const ease = x => { const c = THREE.MathUtils.clamp(x, 0, 1); return c * c * (3 - 2 * c); };
+	if (curve.type == 'DwellCurve') {
+		const grip = this.gripOf(curve, fraction);
+		return {
+			position: curve.getPoint(fraction).add(grip.offset),
+			prop: curve.prop,
+			rotation: grip.rotation,
+			ball: grip.ball,
+			closure: ease(fraction * curve.duration / gripCloseSeconds),
+		};
+	}
+	const from = this.gripOf(curve.before, 1);
+	const to = this.gripOf(curve.after, 0);
+	// Empty, the hand eases into a relaxed open palm, and back to the next club's angle as it arrives.
+	const elapsed = fraction * curve.duration;
+	const left = (1 - fraction) * curve.duration;
+	return {
+		ready: Math.min(ease(elapsed / gripReadySeconds), ease(left / gripReadySeconds)),
+		position: curve.before.throwPos.clone().add(from.offset)
+			.lerp(curve.after.catchPos.clone().add(to.offset), fraction),
+		rotation: from.rotation && to.rotation ? from.rotation.clone().slerp(to.rotation, fraction) : undefined,
+		ball: from.ball,
+		closure: 1 - ease(fraction * curve.duration / gripOpenSeconds),
+	};
+}
+
+/** The handle's offset from a club's middle, and the club's rotation, at a point of a dwell. */
+gripOf(dwell, fraction)
+{
+	const rotation = dwell.getRotation(fraction);
+	if (this.props[dwell.prop].type == 'ball' || !rotation)
+		return { offset: v3(0, 0, 0), rotation: undefined, ball: true };
+	return { offset: v3(0, -clubGrip, 0).applyQuaternion(rotation), rotation, ball: false };
 }
 
 togglePause()

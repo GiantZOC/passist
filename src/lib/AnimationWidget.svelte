@@ -16,6 +16,7 @@
 	export let animationSpeed = defaults.animationSpeed;
 	export let showOrbits = false;
 	export let resolution = 'medium';
+<<<<<<< HEAD
 	/**
 	 * The export surface, read by an embedding page as `widget.api`.
 	 *
@@ -26,6 +27,12 @@
 	export let api = null;
 	/** The footer drawn into an exported frame: the pair being shown, e.g. `3C69B + 09C99`. */
 	export let stamp = '';
+	/** Per juggler, by index: a rigged model to draw instead of the default figure. See ModelJuggler. */
+	export let jugglerModels = [];
+	/** The surroundings, fixed when the widget mounts: 'passist' (grass and a teal sky) or 'clean'. */
+	export let scenery = 'passist';
+	/** Where Passist's own images are served from (`<resourceBase>/images/...`); passist.org if left out. */
+	export let resourceBase = undefined;
 
 	let animation;
 	let paused = false;
@@ -61,7 +68,7 @@
 
 	$: animationJif = Jif.complete(jif).jif; // add missing things, TODO: show warnings
 	$: pixelRatio = { low:0.5, medium:1, high:2 }[resolution];
-	$: animationOptions = { valid, jugglingSpeed, animationSpeed, showOrbits };
+	$: animationOptions = { valid, jugglingSpeed, animationSpeed, showOrbits, jugglerModels, scenery, resourceBase };
 	$: sizeOptions = { width, height, pixelRatio };
 
 	const dispatch = createEventDispatcher();
@@ -76,6 +83,9 @@
 	};
 	onMount(async () => {
 		const Animation = (await import('./animation.mjs')).default; // dynamic import, only on browser
+		await Animation.loadModels(jugglerModels);
+		if (!canvas)
+			return; // destroyed while the models loaded
 
 		animation = new Animation(canvas, animationJif, animationOptions, sizeOptions);
 		api = {
@@ -239,7 +249,7 @@
 />
 
 <div bind:this={container} class=container class:isFullscreen class:isMaximized bind:clientWidth={width} bind:clientHeight={height} >
-	<div class=background />
+	<div class=background style:background-color={scenery == 'clean' ? '#e9eef2' : null} />
 	<canvas
 		bind:this={canvas}
 		class:dragging={dragStart}
