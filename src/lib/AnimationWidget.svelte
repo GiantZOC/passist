@@ -16,7 +16,6 @@
 	export let animationSpeed = defaults.animationSpeed;
 	export let showOrbits = false;
 	export let resolution = 'medium';
-<<<<<<< HEAD
 	/**
 	 * The export surface, read by an embedding page as `widget.api`.
 	 *
