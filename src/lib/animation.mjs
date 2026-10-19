@@ -422,6 +422,9 @@ const fingerCurl = [1.05, 1.3, 0.8];
 const thumbCurl = [0.5, 0.6];
 // The furthest a wrist bends from straight, radians.
 const maxWristBend = 1.2;
+// How far below its throw a ModelJuggler's hand catches a zip, metres: a hand and a handle's depth, so
+// the hand handing the club across passes over it.
+const zipDrop = 0.12;
 
 // A ModelJuggler is scaled to stand this tall, whatever the model's own size: two models side by side
 // are the same height.
@@ -620,9 +623,14 @@ catchPosition(side)
 	return this.handPoint(side, -this.layout.offset, this.layout.catchY);
 }
 
+/**
+ * A zip is caught under the hand that hands it across, not beside it: the catching hand stays as far out
+ * as it throws from and drops below the throw. Reaching in to the body's middle at the throw's own height,
+ * as it did, put the two hands through each other, a hand's width apart with a club in each.
+ */
 zipCatchPosition(side)
 {
-	return this.handPoint(side, 2 * this.layout.offset, this.layout.throwY);
+	return this.handPoint(side, this.layout.offset, this.layout.throwY - zipDrop);
 }
 
 /**
