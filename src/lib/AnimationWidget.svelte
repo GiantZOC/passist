@@ -26,6 +26,8 @@
 	export let api = null;
 	/** The footer drawn into an exported frame: the pair being shown, e.g. `3C69B + 09C99`. */
 	export let stamp = '';
+	/** The footer's lower-right text: where the clip came from, e.g. `https://juggling.digital`. */
+	export let stampRight = '';
 	/** Per juggler, by index: a rigged model to draw instead of the default figure. See ModelJuggler. */
 	export let jugglerModels = [];
 	/** The surroundings, fixed when the widget mounts: 'passist' (grass and a teal sky) or 'clean'. */
@@ -93,12 +95,12 @@
 			cycles: () => (animation.cycleDuration() < 3000 ? 2 : 1),
 			// The page shares a file, not a canvas: the snapshot is encoded here.
 			image: (options) => new Promise((resolve, reject) => {
-				animation.snapshot({ stamp, ...options }).toBlob(
+				animation.snapshot({ stamp, stampRight, ...options }).toBlob(
 					(blob) => (blob ? resolve(blob) : reject(new Error('The image could not be encoded'))),
 					'image/png',
 				);
 			}),
-			video: (options) => animation.recordCycles({ stamp, ...options }),
+			video: (options) => animation.recordCycles({ stamp, stampRight, ...options }),
 		};
 		loaded = true;
 		fpsInterval = setInterval(() => fps = animation.fps, 1000);

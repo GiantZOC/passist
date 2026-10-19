@@ -1697,21 +1697,33 @@ beginExport({ width, height })
 }
 
 /**
- * A footer for an exported frame, so a saved clip carries what it is.
+ * A footer for an exported frame, so a saved clip carries what it is: `text` in the lower left, and
+ * `right` (where the clip came from, e.g. the site's address) in the lower right.
  *
  * Drawn on the export canvas and not in the scene: the footer belongs to the export, so the page's own
  * animation never shows it.
  */
-static stamp(ctx, text, width, height)
+static stamp(ctx, text, width, height, right = '')
 {
-	if (!text) return;
+	if (!text && !right) return;
 	const band = Math.round(height / 12);
 	ctx.font = `${Math.round(height / 24)}px sans-serif`;
 	ctx.textBaseline = 'bottom';
-	ctx.fillStyle = 'rgba(0,0,0,0.45)';
-	ctx.fillRect(0, height - band, ctx.measureText(text).width + band, band);
-	ctx.fillStyle = 'rgba(255,255,255,0.9)';
-	ctx.fillText(text, band / 2, height - band / 3);
+	if (text) {
+		ctx.fillStyle = 'rgba(0,0,0,0.45)';
+		ctx.fillRect(0, height - band, ctx.measureText(text).width + band, band);
+		ctx.fillStyle = 'rgba(255,255,255,0.9)';
+		ctx.textAlign = 'left';
+		ctx.fillText(text, band / 2, height - band / 3);
+	}
+	if (right) {
+		const w = ctx.measureText(right).width + band;
+		ctx.fillStyle = 'rgba(0,0,0,0.45)';
+		ctx.fillRect(width - w, height - band, w, band);
+		ctx.fillStyle = 'rgba(255,255,255,0.9)';
+		ctx.textAlign = 'right';
+		ctx.fillText(right, width - band / 2, height - band / 3);
+	}
 }
 
 /**
@@ -1728,7 +1740,7 @@ static stamp(ctx, text, width, height)
  * it arrived: a clip is as long as the drawing of it took. A background tab throttles that schedule and
  * the clip comes out slow, so this is a foreground-tab feature.
  */
-async recordCycles({ cycles = 2, fps = 30, width = 960, height = 540, stamp = '', onProgress } = {})
+async recordCycles({ cycles = 2, fps = 30, width = 960, height = 540, stamp = '', stampRight = '', onProgress } = {})
 {
 	if (typeof MediaRecorder === 'undefined')
 	throw new Error('This browser cannot record video');
@@ -1759,7 +1771,7 @@ async recordCycles({ cycles = 2, fps = 30, width = 960, height = 540, stamp = ''
 		this.setTime(frame * perFrame / 1000 * this.options.animationSpeed % this.periodSeconds);
 		this.renderer.render(this.scene, this.camera);
 		ctx.drawImage(export_.canvas, 0, 0, width, height);
-		Animation.stamp(ctx, stamp, width, height);
+		Animation.stamp(ctx, stamp, width, height, stampRight);
 		if (onProgress) onProgress((frame + 1) / frames);
 		const wait = started + (frame + 1) * perFrame - performance.now();
 		if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
@@ -1773,7 +1785,7 @@ async recordCycles({ cycles = 2, fps = 30, width = 960, height = 540, stamp = ''
 /**
  * The frame the animation is showing, as a canvas of the export size.
  */
-snapshot({ width = 960, height = 540, stamp = '' } = {})
+snapshot({ width = 960, height = 540, stamp = '', stampRight = '' } = {})
 {
 	const out = document.createElement('canvas');
 	out.width = width;
@@ -1786,7 +1798,7 @@ snapshot({ width = 960, height = 540, stamp = '' } = {})
 	this.setTime(time);
 	this.renderer.render(this.scene, this.camera);
 	ctx.drawImage(export_.canvas, 0, 0, width, height);
-	Animation.stamp(ctx, stamp, width, height);
+	Animation.stamp(ctx, stamp, width, height, stampRight);
 	export_.stop();
 	return out;
 }
