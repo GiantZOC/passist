@@ -61,6 +61,11 @@ const configs = [
 		file: 'static/api/ladder-diagram-widget-standalone.mjs',
 	},
 	{
+		input: './src/lib/StageMapWidget.svelte',
+		name: 'StageMapWidget',
+		file: 'static/api/stage-map-widget-standalone.mjs',
+	},
+	{
 		input: './src/lib/AnimationWidget.svelte',
 		name: 'AnimationWidget',
 		file: 'static/api/animation-widget-standalone.mjs',

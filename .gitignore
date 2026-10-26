@@ -7,5 +7,6 @@ tmp/
 static/api/animation-widget-standalone.*
 static/api/causal-diagram-widget-standalone.*
 static/api/ladder-diagram-widget-standalone.*
+static/api/stage-map-widget-standalone.*
 .svelte-kit/
 build/
