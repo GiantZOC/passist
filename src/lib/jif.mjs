@@ -153,6 +153,113 @@ function _completeJugglerDetails({ jif, warnings, nJugglers })
 }
 
 
+/**
+ * A moving juggler's `path`, tidied: the keys put in time order, a key on beat 0 seeded from the juggler's
+ * `position`, the end of the period checked against the start, and the whole path repeated when the repetition
+ * is expanded — a path is written over one round, and an expanded JIF runs several.
+ *
+ * The path is left out entirely when it cannot be read, with a warning, so a still juggler animates where they
+ * stand rather than nowhere.
+ */
+function _completeJugglerPath({ jif, warnings })
+{
+	const round = jif.repetition && typeof jif.repetition.period == 'number' ? jif.repetition.period : undefined;
+
+	const point = (v) => v.length >= 3 ? [v[0], v[1], v[2]] : [v[0], 0, v[1]];
+	const same = (a, b) => a.every((v, i) => Math.abs(v - b[i]) < 1e-6);
+
+	jif.jugglers.forEach((juggler, index) => {
+		const path = juggler.path;
+		if (typeof path == 'undefined')
+			return;
+
+		if (typeof path != 'object' || path === null || !Array.isArray(path.keys)) {
+			warnings.push(`jugglers[${index}].path is not an object with keys, removing it`);
+			delete juggler.path;
+			return;
+		}
+
+		const keys = [];
+		path.keys.forEach((key, k) => {
+			const wellFormed = typeof key == 'object' && key !== null
+				&& typeof key.time == 'number' && isFinite(key.time)
+				&& Array.isArray(key.position) && key.position.length >= 2
+				&& key.position.every((v) => typeof v == 'number' && isFinite(v));
+			if (!wellFormed) {
+				warnings.push(`jugglers[${index}].path.keys[${k}] needs a time and a position, dropping it`);
+				return;
+			}
+			const lookAt = Array.isArray(key.lookAt) && key.lookAt.length >= 2 && key.lookAt.every((v) => typeof v == 'number')
+				? point(key.lookAt)
+				: juggler.lookAt.slice();
+			keys.push({ time: key.time, position: point(key.position), lookAt });
+		});
+		if (!keys.length) {
+			warnings.push(`jugglers[${index}].path has no usable keys, removing it`);
+			delete juggler.path;
+			return;
+		}
+		keys.sort((a, b) => a.time - b.time);
+
+		const period = typeof path.period == 'number' && path.period > 0 ? path.period : round;
+		if (!(period > 0)) {
+			warnings.push(`jugglers[${index}].path has no period and the jif no repetition, removing it`);
+			delete juggler.path;
+			return;
+		}
+		if (typeof round == 'number' && Math.abs(round / period - Math.round(round / period)) > 1e-9)
+			warnings.push(`jugglers[${index}].path runs ${period} beats, which does not divide the ${round} the pattern repeats over`);
+
+		if (keys[0].time < 0) {
+			warnings.push(`jugglers[${index}].path starts at beat ${keys[0].time}, before the pattern, so it starts at 0`);
+			while (keys.length && keys[0].time < 0)
+				keys.shift();
+			if (!keys.length) {
+				warnings.push(`jugglers[${index}].path is all before the pattern, removing it`);
+				delete juggler.path;
+				return;
+			}
+		}
+		if (keys[0].time > 0)
+			keys.unshift({ time: 0, position: juggler.position.slice(), lookAt: juggler.lookAt.slice() });
+
+		// The path wraps to its first key on the period's beat, so a key written there is never reached.
+		while (keys.length > 1 && keys[keys.length - 1].time >= period - 1e-9) {
+			const last = keys.pop();
+			if (!same(last.position, keys[0].position))
+				warnings.push(`jugglers[${index}].path ends at ${JSON.stringify(last.position)}, not where it starts, ${JSON.stringify(keys[0].position)}`);
+		}
+
+		juggler.path = { period, keys };
+		// The juggler is where the path starts, whatever position they were given.
+		juggler.position = keys[0].position.slice();
+		juggler.lookAt = keys[0].lookAt.slice();
+	});
+
+	// Expanded, a path written over one round repeats with the throws.
+	if (typeof round == 'number') {
+		for (const juggler of jif.jugglers) {
+			const path = juggler.path;
+			if (!path)
+				continue;
+			const rounds = Math.round(round / path.period);
+			if (rounds < 2 || Math.abs(rounds * path.period - round) > 1e-9)
+				continue;
+			const keys = [];
+			for (let r = 0; r < rounds; r++)
+				for (const key of path.keys)
+					keys.push(Object.assign({}, key, { time: key.time + r * path.period }));
+			juggler.path = { period: round, keys };
+		}
+	}
+
+	if (jif.jugglers.some((juggler) => juggler.path)) {
+		const extensions = Array.isArray(jif.meta.passistExtensions) ? jif.meta.passistExtensions : [];
+		if (!extensions.includes('path'))
+			jif.meta.passistExtensions = [...extensions, 'path'];
+	}
+}
+
 function _completeRepetition({ jif, warnings })
 {
 	const rep = jif.repetition;
@@ -453,6 +560,8 @@ export default class Jif
 				propPermutation: [...Array(jif.props.length).keys()],
 			};
 		}
+
+		_completeJugglerPath({ jif, warnings });
 
 		return { jif, warnings, initialProps };
 	}
