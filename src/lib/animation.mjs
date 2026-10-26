@@ -4,6 +4,7 @@ import * as THREE from 'three';
 // import {OrbitControls} from "three/examples/jsm/controls/OrbitControls.js"; # this does not work (2021-05) as vite treats it as commonjs
 import { OrbitControls } from "./OrbitControls.mjs"; // <-- symlink hack to treat it like the module it actually is
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { pathPose, pathSamples } from './path.mjs';
 import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 
 const hu = 0.21;
@@ -1284,6 +1285,21 @@ updateScene(jif, options)
 		this.bbox.expandByObject(j);
 	}
 
+	// Jugglers who move have a path each (`jugglers[i].path`, see path.mjs): posed every frame in setPositions,
+	// and at each throw and catch below, so a club leaves a moving hand and lands in one. A JIF without paths
+	// takes none of these branches.
+	this.paths = jif.jugglers.map(juggler => juggler.path && juggler.path.keys && juggler.path.keys.length ? juggler.path : null);
+	this.moving = this.paths.some(Boolean);
+	if (this.moving) {
+		for (const [index, j] of this.jugglers.entries()) {
+			for (const pose of pathSamples(this.paths[index], 48)) {
+				this.poseJuggler(index, pose);
+				this.bbox.expandByObject(j);
+			}
+		}
+		this.poseJugglersAt(0);
+	}
+
 	if (!options.valid) {
 		for (const j of this.jugglers) {
 			j.lookAt(this.camera.position.clone().setY(0));
@@ -1371,14 +1387,26 @@ updateScene(jif, options)
 			const up = v3(0, 1, 0);
 			t.throwPos = this.throwPositions[t.from];
 			t.catchPos = this.catchPositions[t.to];
+			let fromFacing = this.jugglers[jugglerFrom].facing;
+			let zipCatchPos = this.zipCatchPositions[t.to];
+			if (this.moving) {
+				// Where the thrower stands as the club leaves, and where the catcher stands as it arrives.
+				const sideOf = limb => (jif.limbs[limb].type.match(/left/) ? 1 : 0);
+				this.poseJugglersAt(t.time);
+				t.throwPos = this.jugglers[jugglerFrom].throwPosition(sideOf(t.from));
+				fromFacing = this.jugglers[jugglerFrom].facing;
+				this.poseJugglersAt(t.time + t.duration - t.dwell);
+				t.catchPos = this.jugglers[jugglerTo].catchPosition(sideOf(t.to));
+				zipCatchPos = this.jugglers[jugglerTo].zipCatchPosition(sideOf(t.to));
+			}
 			t.throwAngle = 1.5 * Math.PI; // TODO: make this dependent on throw (type, duration, where its supposed to go)
 			if (jugglerFrom == jugglerTo) { // self - TODO: improve angle for crossing selfs
-				t.axis = this.jugglers[jugglerFrom].facing.cross(up);
+				t.axis = fromFacing.clone().cross(up);
 				t.catchAngle = 1.5 * Math.PI;
 
 				// zip like
 				if (soloHeight < 2.5 && t.from != t.to)
-					t.catchPos = this.zipCatchPositions[t.to];
+					t.catchPos = zipCatchPos;
 			} else { // pass
 				t.axis = t.catchPos.clone().sub(t.throwPos).normalize().cross(up);
 				t.catchAngle = 2 * Math.PI;
@@ -1425,6 +1453,9 @@ updateScene(jif, options)
 			}
 		}
 	}
+
+	if (this.moving)
+		this.poseJugglersAt(0);
 
 	// calculate prop movements during dwell
 	propThrows.forEach((throwCurves, prop) => {
@@ -1540,6 +1571,10 @@ animate()
  */
 setPositions(t)
 {
+	// Bodies first: a hand is placed in the world, and its arm reaches from wherever the body now is.
+	if (this.moving)
+		this.poseJugglersAt(t * this.beatsPerSecond);
+
 	for (const p of this.props) {
 		let visible = false;
 		if (p.movement.getPosition(t, p.mesh.position))
@@ -1619,6 +1654,27 @@ gripOf(dwell, fraction)
 	if (this.props[dwell.prop].type == 'ball' || !rotation)
 		return { offset: v3(0, 0, 0), rotation: undefined, ball: true };
 	return { offset: v3(0, -clubGrip, 0).applyQuaternion(rotation), rotation, ball: false };
+}
+
+/** Stands juggler `index` at a pose from path.mjs: `{ position, heading }`. */
+poseJuggler(index, pose)
+{
+	if (!pose)
+		return;
+	const j = this.jugglers[index];
+	const [x, y, z] = pose.position;
+	j.position.set(x, y, z);
+	j.lookAt(x + Math.sin(pose.heading), y, z + Math.cos(pose.heading));
+	j.updateMatrixWorld(true);
+}
+
+/** Stands every juggler who has a path where it puts them at `beats`. */
+poseJugglersAt(beats)
+{
+	this.paths.forEach((path, index) => {
+		if (path)
+			this.poseJuggler(index, pathPose(path, beats));
+	});
 }
 
 togglePause()
