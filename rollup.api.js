@@ -56,6 +56,11 @@ const configs = [
 		file: 'static/api/causal-diagram-widget-standalone.mjs',
 	},
 	{
+		input: './src/lib/LadderDiagramWidget.svelte',
+		name: 'LadderDiagramWidget',
+		file: 'static/api/ladder-diagram-widget-standalone.mjs',
+	},
+	{
 		input: './src/lib/AnimationWidget.svelte',
 		name: 'AnimationWidget',
 		file: 'static/api/animation-widget-standalone.mjs',

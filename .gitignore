@@ -6,5 +6,6 @@ yarn-error.log
 tmp/
 static/api/animation-widget-standalone.*
 static/api/causal-diagram-widget-standalone.*
+static/api/ladder-diagram-widget-standalone.*
 .svelte-kit/
 build/

@@ -24,10 +24,13 @@
 		if (fromLine != toLine || Math.abs(step) >= jif.timeStretchFactor * 0.7 && Math.abs(step) <= jif.timeStretchFactor) // TODO: add collision detection
 			return "M" + xy(time, r, x(time2), y(toLine), fromLine) + " L" + xy(time2, r + arrowLength, x(time), y(fromLine), toLine);
 		let dirX = x(time2) > x(time) ? 1 : -1;
+		// a self throw bows away from the other lines: up from the first, down from the last, and from a
+		// line between two others only a third of the way to the next, so it stays clear of that line's own
 		const dirY = fromLine ? 1 : -1;
+		const between = fromLine > 0 && fromLine < nLines - 1;
 
 		let offsetX = dirX * dy / 2;
-		const offsetY = dirY * dy / 2;
+		const offsetY = dirY * dy / (between ? 3 : 2);
 
 		if (step == 0) {
 			offsetX /= 2;
