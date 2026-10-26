@@ -387,7 +387,10 @@ function _assignProps({ jif, warnings })
 	const holding = jif.limbs.map(() => []);
 	const initialProps = jif.limbs.map(() => []);
 
-	const catches = new Heap((a, b) => a.time - b.time);
+	// Props caught in one hand at one instant are re-thrown in the order a hand holds them: the prop that
+	// arrived last lies on top and leaves first. Their landing times tie, so the throw times decide, and
+	// the prop's own number keeps the order fixed where those tie too.
+	const catches = new Heap((a, b) => a.time - b.time || b.thrown - a.thrown || a.prop - b.prop);
 
 	let lastIteration = -1;
 	let unassignedCount = 1;
@@ -418,7 +421,7 @@ function _assignProps({ jif, warnings })
 			nProps++;
 			unassignedCount++;
 		}
-		catches.push({time: throw_.time + throw_.duration, to: throw_.to, prop});
+		catches.push({time: throw_.time + throw_.duration, thrown: throw_.time, to: throw_.to, prop});
 		if (!throw_.iteration)
 			jif.throws[index].prop = prop;
 		if (period) {
