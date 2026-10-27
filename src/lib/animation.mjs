@@ -5,6 +5,7 @@ import * as THREE from 'three';
 import { OrbitControls } from "./OrbitControls.mjs"; // <-- symlink hack to treat it like the module it actually is
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { pathPose, pathSamples } from './path.mjs';
+import { fromBody, handSteps, toBody } from './hands.mjs';
 import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 
 const hu = 0.21;
@@ -916,6 +917,94 @@ static damping(x)
 
 } // end class DwellCurve
 
+/**
+ * A club carried while its juggler walks: a dwell drawn in the juggler's own coordinates and put back in the
+ * world wherever their path has them at that moment, so the club goes with the hand that holds it. `pose(s)`
+ * is the juggler's path.mjs pose at s seconds; `catchPos` and `throwPos` stay the world points, which is
+ * what the empty-hand moves either side of it are drawn between.
+ */
+class CarriedDwellCurve extends DwellCurve
+{
+
+constructor(p)
+{
+	const catchPose = p.pose(p.start);
+	const throwPose = p.pose(p.start + p.duration);
+	const local = (pose, v) => new THREE.Vector3(...toBody(pose, v.toArray()));
+	const turn = (pose, v) => local({ position: [0, 0, 0], heading: pose.heading }, v);
+	super({
+		...p,
+		catchPos: local(catchPose, p.catchPos),
+		throwPos: local(throwPose, p.throwPos),
+		vCatch: turn(catchPose, p.vCatch),
+		vThrow: turn(throwPose, p.vThrow),
+		catchAxis: p.catchAxis && turn(catchPose, p.catchAxis),
+		throwAxis: p.throwAxis && turn(throwPose, p.throwAxis),
+	});
+	this.catchPos = p.catchPos;
+	this.throwPos = p.throwPos;
+}
+
+poseAt(t)
+{
+	return this.pose(this.start + t * this.duration);
+}
+
+getPoint(t, optionalTarget)
+{
+	const point = super.getPoint(t, optionalTarget);
+	return point.fromArray(fromBody(this.poseAt(t), point.toArray()));
+}
+
+getRotation(t, optionalTarget)
+{
+	const rotation = super.getRotation(t, optionalTarget);
+	if (!rotation)
+		return rotation;
+	const heading = new THREE.Quaternion().setFromAxisAngle(v3(0, 1, 0), this.poseAt(t).heading);
+	return rotation.premultiply(heading);
+}
+
+} // end class CarriedDwellCurve
+
+/**
+ * The rest of a dwell, from fraction `from`: what a hand still holding another club takes up once that one is
+ * thrown (hands.mjs). It reads as the dwell it is part of.
+ */
+class TrimmedDwell
+{
+
+constructor(dwell, from, periodSeconds)
+{
+	this.type = 'DwellCurve';
+	this.dwell = dwell;
+	this.from = from;
+	this.prop = dwell.prop;
+	this.hand = dwell.hand;
+	this.catchPos = dwell.getPoint(from);
+	this.throwPos = dwell.throwPos;
+	this.start = (dwell.start + from * dwell.duration) % periodSeconds;
+	this.duration = (1 - from) * dwell.duration;
+	this.held = from * dwell.duration; // seconds the club has already been in the hand
+}
+
+fraction(t)
+{
+	return this.from + t * (1 - this.from);
+}
+
+getPoint(t, optionalTarget)
+{
+	return this.dwell.getPoint(this.fraction(t), optionalTarget);
+}
+
+getRotation(t, optionalTarget)
+{
+	return this.dwell.getRotation(this.fraction(t), optionalTarget);
+}
+
+} // end class TrimmedDwell
+
 class LinearCurve extends THREE.Curve
 {
 
@@ -1440,6 +1529,8 @@ updateScene(jif, options)
 				catchAngle: t.catchAngle,
 				isSelf:   jugglerFrom == jugglerTo,
 			});
+			// The dwell the throw lands into, in seconds — a club that waits longer is carried (below).
+			t.throwCurve.dwell = t.dwell / this.beatsPerSecond;
 			propThrows[t.prop].push(t.throwCurve);
 
 			for (const p of t.throwCurve.getPoints(11))
@@ -1472,7 +1563,12 @@ updateScene(jif, options)
 			const dwellDuration = end - start + (end >= start - 1e-10 ? 0 : periodSeconds);
 
 			if (dwellDuration > 0) {
-				const dwellCurve = new DwellCurve({
+				// A club held past its own dwell while its juggler walks is carried with them.
+				const path = this.paths[jif.limbs[curve.from].juggler];
+				const carried = this.moving && path && dwellDuration > last.dwell + 1e-6;
+				const Dwell = carried ? CarriedDwellCurve : DwellCurve;
+				const dwellCurve = new Dwell({
+					...(carried ? { pose: seconds => pathPose(path, seconds * this.beatsPerSecond) } : {}),
 					catchPos: last.catchPos,
 					throwPos: curve.throwPos,
 					vCatch: last.v1.clone(),
@@ -1506,24 +1602,27 @@ updateScene(jif, options)
 		});
 	});
 
-	// calculate hand movements between dwells (return to catch position)
+	// calculate hand movements between dwells (return to catch position); where a carried club's dwell
+	// overlaps the next one, the hand keeps the first until it is thrown (hands.mjs)
 	for (const hand of this.hands) {
 		const pc = [];
-		hand.positionCurves.sort((a, b) => a.start - b.start);
-		let last = hand.positionCurves[hand.positionCurves.length - 1];
-		for (const curve of hand.positionCurves) {
-			const start = last.start + last.duration
-			const end = curve.start;
-			pc.push(new LinearCurve({
-				fromPoint: last.throwPos,
-				toPoint: curve.catchPos,
-				before: last, // the dwells either side, for a ModelJuggler's grip
-				after: curve,
-				start: start,
-				duration: end - start + (end > start ? 0 : periodSeconds),
-			}));
+		const dwells = hand.positionCurves.sort((a, b) => a.start - b.start);
+		const followed = dwells.slice(); // what the hand holds of each, once it takes it up
+		for (const step of handSteps(dwells, periodSeconds)) {
+			if (step.gap) {
+				pc.push(new LinearCurve({
+					fromPoint: followed[step.before].throwPos,
+					toPoint: dwells[step.after].catchPos,
+					before: followed[step.before], // the dwells either side, for a ModelJuggler's grip
+					after: dwells[step.after],
+					start: step.start,
+					duration: step.duration,
+				}));
+				continue;
+			}
+			const curve = step.from ? new TrimmedDwell(dwells[step.dwell], step.from, periodSeconds) : dwells[step.dwell];
+			followed[step.dwell] = curve;
 			pc.push(curve);
-			last = curve;
 		}
 		hand.movement = new Movement({
 			positionCurves: pc,
@@ -1629,7 +1728,7 @@ holdAt(hand, t)
 			prop: curve.prop,
 			rotation: grip.rotation,
 			ball: grip.ball,
-			closure: ease(fraction * curve.duration / gripCloseSeconds),
+			closure: ease(((curve.held ?? 0) + fraction * curve.duration) / gripCloseSeconds),
 		};
 	}
 	const from = this.gripOf(curve.before, 1);
