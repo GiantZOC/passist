@@ -398,7 +398,11 @@ const readyModels = {};
 function loadModel(url)
 {
 	loadedModels[url] ??= new GLTFLoader().loadAsync(url).then(
-		gltf => readyModels[url] = gltf.scene,
+		gltf => {
+			// The clips go with the scene, which is what a ModelJuggler is made from (its legs walk by them).
+			gltf.scene.animations = gltf.animations;
+			return readyModels[url] = gltf.scene;
+		},
 		error => {
 			console.warn('juggler model ' + url + ' did not load, drawing the default juggler', error);
 			return null;
@@ -427,6 +431,16 @@ const maxWristBend = 1.2;
 // How far below its throw a ModelJuggler's hand catches a zip, metres: a hand and a handle's depth, so
 // the hand handing the club across passes over it.
 const zipDrop = 0.12;
+
+// The model's gait clips, by the name build-models.mjs gives them: a walk, and a sideways step either way.
+const gaitClips = ['walk', 'side-left', 'side-right'];
+// How far a sideways step goes towards its clip: the clips are a run, and a juggler side-stepping across a
+// pattern shuffles.
+const sideStepAmplitude = 0.5;
+// A juggler walking slower than this, metres a second, walks with smaller steps, down to standing still.
+const fullStrideSpeed = 0.5;
+// Samples a beat of the walked-distance table a moving juggler's gait is read from.
+const gaitSamplesPerBeat = 32;
 
 // A ModelJuggler is scaled to stand this tall, whatever the model's own size: two models side by side
 // are the same height.
@@ -547,8 +561,117 @@ constructor(source, spec)
 		bottom:  0.45 * arm.shoulder.y, // the hips' height, roughly: below it the legs are narrower
 	};
 
+	this.gait = ModelJuggler.readGait(this, model, source.animations || []);
+
 	if (spec.label)
 		this.add(ModelJuggler.labelSprite(spec.label, spec.labelColor || colors[Object.keys(colors)[0]] || '#333'));
+}
+
+/**
+ * The model's walk, read from its gait clips (see web/scripts/build-models.mjs): for every bone a clip moves,
+ * its rest value and a sampler per clip, and how far one cycle of each clip carries a juggler. Null when the
+ * model has no walk, which leaves its legs as they stand.
+ */
+static readGait(juggler, model, clips)
+{
+	const found = Object.fromEntries(gaitClips.map(name => [name, clips.find(clip => clip.name == name)]));
+	if (!found.walk)
+		return null;
+	const bones = new Map();
+	for (const [name, clip] of Object.entries(found)) {
+		if (!clip)
+			continue;
+		for (const track of clip.tracks) {
+			const { nodeName, propertyName } = THREE.PropertyBinding.parseTrackName(track.name);
+			const node = model.getObjectByName(nodeName);
+			if (!node || (propertyName != 'quaternion' && propertyName != 'position'))
+				continue;
+			const key = nodeName + '.' + propertyName;
+			if (!bones.has(key))
+				bones.set(key, { node, property: propertyName, rest: node[propertyName].clone(), clips: {} });
+			bones.get(key).clips[name] = { interpolant: track.createInterpolant(), duration: clip.duration };
+		}
+	}
+
+	// How far a clip carries the juggler in a cycle: the clips walk on the spot, so the foot on the floor (the
+	// lower one) slides back under the body as far as the body would have gone. Measured in the juggler's own
+	// frame (x to its left, z forward); the feet are the rig's IK targets, moved by their own tracks alone.
+	const feet = ['FootL', 'FootR'].map(name => bones.get(name + '.position'));
+	const stride = (name, axis) => {
+		if (feet.some(foot => !foot || !foot.clips[name]))
+			return 0;
+		const samples = 32, at = [];
+		for (let k = 0; k < samples; k++) {
+			at.push(feet.map(foot => {
+				const clip = foot.clips[name];
+				foot.node.position.fromArray(clip.interpolant.evaluate(k / samples * clip.duration));
+				foot.node.updateMatrixWorld(true);
+				return juggler.worldToLocal(foot.node.getWorldPosition(new THREE.Vector3()));
+			}));
+		}
+		feet.forEach(foot => foot.node.position.copy(foot.rest));
+		let slid = 0;
+		for (let k = 0; k < samples; k++) {
+			const now = at[k], next = at[(k + 1) % samples];
+			const planted = now[0].y < now[1].y ? 0 : 1;
+			slid += next[planted][axis] - now[planted][axis];
+		}
+		return Math.abs(slid);
+	};
+	juggler.updateMatrixWorld(true);
+	const walkStride = stride('walk', 'z');
+	const sideStride = sideStepAmplitude * Math.max(stride('side-left', 'x'), stride('side-right', 'x'));
+	return {
+		bones: [...bones.values()],
+		walkStride: walkStride || 1.3,
+		sideStride: sideStride || walkStride || 1.3,
+	};
+}
+
+/**
+ * The legs at a point of the walk: `phase` is the fraction of the way through a stride, `forward` and `side`
+ * the share of the walk that goes forward (negative: backwards) and to the juggler's left (negative: right),
+ * and `weight` how far from standing still, 0 to 1. Forward is the walk clip, played backwards for a juggler
+ * walking backwards; sideways is the side-step clip, at half its stride.
+ */
+setGait({ phase, forward, side, weight })
+{
+	const gait = this.gait;
+	if (!gait)
+		return;
+	const sideClip = side >= 0 ? 'side-left' : 'side-right';
+	const along = Math.abs(forward) + Math.abs(side);
+	const sideShare = along > 0 ? Math.abs(side) / along : 0;
+	const walkPhase = forward >= 0 ? phase : 1 - phase;
+	const sample = (bone, name, at) => {
+		const clip = bone.clips[name];
+		if (!clip)
+			return bone.rest;
+		const value = clip.interpolant.evaluate(((at % 1) + 1) % 1 * clip.duration);
+		return bone.property == 'quaternion' ? new THREE.Quaternion().fromArray(value) : new THREE.Vector3().fromArray(value);
+	};
+	for (const bone of gait.bones) {
+		const walked = sample(bone, 'walk', walkPhase);
+		const stepped = sample(bone, sideClip, phase);
+		const value = bone.node[bone.property];
+		if (bone.property == 'quaternion') {
+			const sideways = bone.rest.clone().slerp(stepped, sideStepAmplitude);
+			value.copy(walked).slerp(sideways, sideShare);
+			value.copy(bone.rest.clone().slerp(value, weight));
+		} else {
+			const sideways = bone.rest.clone().lerp(stepped, sideStepAmplitude);
+			value.copy(walked).lerp(sideways, sideShare);
+			value.copy(bone.rest.clone().lerp(value, weight));
+		}
+	}
+}
+
+/** Stands the legs at rest. */
+standStill()
+{
+	if (this.gait)
+		for (const bone of this.gait.bones)
+			bone.node[bone.property].copy(bone.rest);
 }
 
 static labelSprite(text, color)
@@ -1386,6 +1509,9 @@ updateScene(jif, options)
 				this.bbox.expandByObject(j);
 			}
 		}
+		// A model juggler's legs walk where their path goes; Passist's own figure (past eight jugglers, or a model
+		// that did not load) has no gait and glides as before.
+		this.gaits = this.paths.map((path, index) => path && this.jugglers[index].gait ? this.gaitTable(path, this.jugglers[index].gait) : null);
 		this.poseJugglersAt(0);
 	}
 
@@ -1767,13 +1893,74 @@ poseJuggler(index, pose)
 	j.updateMatrixWorld(true);
 }
 
-/** Stands every juggler who has a path where it puts them at `beats`. */
+/** Stands every juggler who has a path where it puts them at `beats`, their legs where their walk has got to. */
 poseJugglersAt(beats)
 {
 	this.paths.forEach((path, index) => {
-		if (path)
-			this.poseJuggler(index, pathPose(path, beats));
+		if (!path)
+			return;
+		this.poseJuggler(index, pathPose(path, beats));
+		const table = this.gaits && this.gaits[index];
+		if (table)
+			this.jugglers[index].setGait(this.gaitAt(table, beats));
 	});
+}
+
+/**
+ * How a juggler's legs move round their path: sampled `gaitSamplesPerBeat` times a beat, which way they walk
+ * in their own frame, how fast, and how many strides they have walked since the path's start. The strides
+ * are counted from the distance walked, so a foot on the floor stays where it is put, and are then stretched
+ * a little so the path's period is a whole number of them and the loop closes on the same step. Read by time
+ * alone, so a paused, scrubbed or recorded frame stands the same way as a played one.
+ */
+gaitTable(path, gait)
+{
+	const count = Math.max(2, Math.round(path.period * gaitSamplesPerBeat));
+	const step = path.period / count;
+	const poses = [];
+	for (let k = 0; k <= count; k++)
+		poses.push(pathPose(path, k * step));
+	const samples = [];
+	let strides = 0;
+	for (let k = 0; k <= count; k++) {
+		const before = pathPose(path, (k - 0.5) * step), after = pathPose(path, (k + 0.5) * step);
+		const dx = (after.position[0] - before.position[0]) / step, dz = (after.position[2] - before.position[2]) / step;
+		const h = poses[k].heading;
+		// Facing (sin h, 0, cos h); the juggler's left is (cos h, 0, -sin h).
+		const forward = dx * Math.sin(h) + dz * Math.cos(h);
+		const side = dx * Math.cos(h) - dz * Math.sin(h);
+		const speed = Math.hypot(forward, side);
+		samples.push({ forward, side, speed, strides });
+		const along = Math.abs(forward) + Math.abs(side);
+		if (k < count && along > 0) {
+			const stride = (Math.abs(forward) * gait.walkStride + Math.abs(side) * gait.sideStride) / along;
+			const dx1 = poses[k + 1].position[0] - poses[k].position[0], dz1 = poses[k + 1].position[2] - poses[k].position[2];
+			strides += Math.hypot(dx1, dz1) / stride;
+		}
+	}
+	const whole = Math.round(strides);
+	if (whole < 1)
+		return null;
+	for (const one of samples)
+		one.strides *= whole / strides;
+	return { period: path.period, step, samples };
+}
+
+/** The legs' pose at `beats` from a gaitTable. */
+gaitAt(table, beats)
+{
+	const t = ((beats % table.period) + table.period) % table.period / table.step;
+	const k = Math.min(Math.floor(t), table.samples.length - 2), f = t - k;
+	const a = table.samples[k], b = table.samples[k + 1];
+	const mix = (name) => a[name] + (b[name] - a[name]) * f;
+	const metresPerSecond = mix('speed') * this.beatsPerSecond;
+	const weight = Math.min(1, metresPerSecond / fullStrideSpeed);
+	return {
+		phase: mix('strides') % 1,
+		forward: mix('forward'),
+		side: mix('side'),
+		weight: weight * weight * (3 - 2 * weight),
+	};
 }
 
 togglePause()

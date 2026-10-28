@@ -121,6 +121,48 @@ test('a spin turns the juggler on the way round, on top of the facing', () => {
                 `half a turn to face the other way and half a spin is a whole turn (${end})`);
 });
 
+// How fast a pose changes either side of a time, so a test can say a walk or a turn does not jerk there.
+const headingOf = (pose) => pose.heading;
+const rate = (path, t, read, side) => {
+	const h = 1e-5;
+	// An angle is only a direction: a heading counted from a different key may differ by whole turns.
+	const turn = (d) => d - 2 * Math.PI * Math.round(d / (2 * Math.PI));
+	const step = (a, b) => (read === headingOf ? turn(read(b) - read(a)) : read(b) - read(a)) / h;
+	return side < 0 ? step(pathPose(path, t - h), pathPose(path, t)) : step(pathPose(path, t), pathPose(path, t + h));
+};
+
+test('a juggler turning as they walk through a key keeps turning, at the same rate', () => {
+	// Walking a square and facing the way round: every key is passed through, and so is every turn.
+	const corner = (time, x, z, degrees) => ({ ...key(time, x, z), lookAt: [x + Math.sin(degrees * Math.PI / 180), 0, z + Math.cos(degrees * Math.PI / 180)] });
+	const path = { period: 4, keys: [corner(0, 0, 0, 0), corner(1, 1, 0, 90), corner(2, 1, 1, 180), corner(3, 0, 1, 270)] };
+	const heading = headingOf;
+	for (const t of [1, 2, 3]) {
+		const into = rate(path, t, heading, -1), out = rate(path, t, heading, 1);
+		assert.ok(Math.abs(into) > 0.5, `still turning into the key at ${t} (${into})`);
+		assert.ok(Math.abs(into - out) < 1e-3, `the turn does not jerk at ${t} (${into} then ${out})`);
+	}
+});
+
+test('a walk through a via point meets the walks either side of it at the same speed', () => {
+	const path = { period: 4, keys: [key(0, 0, 0), { ...key(1, 1, 0), via: [1.5, 0, 0.5] }, key(2, 2, 0), key(3, 1, -1)] };
+	for (const read of [(pose) => pose.position[0], (pose) => pose.position[2]]) {
+		for (const t of [1, 1.5, 2]) {
+			const into = rate(path, t, read, -1), out = rate(path, t, read, 1);
+			assert.ok(Math.abs(into - out) < 1e-3, `no jump in speed at ${t} (${into} then ${out})`);
+		}
+	}
+});
+
+test('a key marked stop is a standstill on the way round, not a beat stood still', () => {
+	const round = { period: 4, keys: [key(0, 0, 0), { ...key(1, 1, 0), stop: true }, key(2, 2, 0), key(3, 1, -1)] };
+	const x = (pose) => pose.position[0];
+	assert.ok(Math.abs(rate(round, 1, x, -1)) < 1e-3, `slowed to a standstill arriving (${rate(round, 1, x, -1)})`);
+	assert.ok(Math.abs(rate(round, 1, x, 1)) < 1e-3, `and sets off from one (${rate(round, 1, x, 1)})`);
+	assert.ok(Math.abs(rate(round, 1.5, x, 1)) > 0.5, 'walking again half a beat later');
+	const through = { period: 4, keys: [key(0, 0, 0), key(1, 1, 0), key(2, 2, 0), key(3, 1, -1)] };
+	assert.ok(Math.abs(rate(through, 1, x, 1)) > 0.5, 'the same key unmarked is walked through');
+});
+
 test('samples walk the cycle and stop before the repeat', () => {
 	const path = { period: 4, keys: [key(0, 0), key(1, 2), key(2, 2), key(3, 0)] };
 	const samples = pathSamples(path, 8);

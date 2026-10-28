@@ -7,15 +7,22 @@
  * juggler arrives at and stays on (the next or the previous key is the same place) is a stop, so a juggler who
  * holds a spot for a beat and then walks eases off it and back onto the next; a key passed through on the way
  * (a point on a figure-eight) is crossed at the speed its neighbours give it, Catmull-Rom style, without a stop.
- * The facing turns the short way round between keys, eased the same.
+ * The facing is eased the same way, counted on round the keys the short way: a juggler who turns as they walk
+ * through a key keeps turning through it, and only a key facing the way its neighbour does is a stop in the turn.
  *
  * A key can say two more things about the walk that leaves it:
  *
  *   via: [x, y, z]   a point the walk passes through on its way to the next key, for a curve round something
- *                    standing in the way. It replaces the Hermite segment with the quadratic through the point
- *                    at the segment's middle, so the walk bulges out and comes back rather than cutting across.
+ *                    standing in the way. The segment becomes two Hermite halves meeting at the point half way
+ *                    through, crossing it parallel to the chord, so the walk bulges out and comes back at the
+ *                    same speed as the walks either side of it.
  *   spin: 1          turns made getting to the next key, on top of the facing turning to wherever the next key
  *                    looks — a pirouette while walking, and 0.5 ends facing the other way.
+ *
+ * And one about the key itself:
+ *
+ *   stop: true       the juggler comes to a standstill on the key and sets off again, without staying on it for
+ *                    a beat: a brief stop to make a pass on the way round.
  *
  * Pure arithmetic and no three.js, so the site that writes these paths can check them with the same code
  * (web/lib/pattern/stage.mjs keeps a copy, and a test there holds the two to the same answers).
@@ -78,35 +85,67 @@ export function pathPose(path, time) {
 	const dt = t1 - t0;
 	const s = dt > 0 ? (now - t0) / dt : 0;
 
-	const p0 = at(i).position, p1 = at(i + 1).position;
-	// A `via` on the key the segment leaves bends it through that point; without one the walk is the Hermite.
-	const via = at(i).via;
-	const through = Array.isArray(via) && via.length == 3 && via.every(Number.isFinite) ? via : null;
+	// A key's neighbours on the walk: the `via` of the segment either side of it when there is one, so a bend and
+	// the walks either side of it meet at the same speed. Each is a point and the time it is reached.
+	const viaOf = (k) => {
+		const via = at(k).via;
+		return Array.isArray(via) && via.length == 3 && via.every(Number.isFinite) ? via : null;
+	};
+	const before = (k) => viaOf(k - 1)
+		? { position: viaOf(k - 1), time: (unwrap(k - 1) + unwrap(k)) / 2 }
+		: { position: at(k - 1).position, time: unwrap(k - 1) };
+	const after = (k) => viaOf(k)
+		? { position: viaOf(k), time: (unwrap(k) + unwrap(k + 1)) / 2 }
+		: { position: at(k + 1).position, time: unwrap(k + 1) };
+	// A key held (the juggler stays on it a beat either side) is a stop; any other is walked through at the
+	// speed its neighbours give it.
 	const tangent = (k) => {
-		const here = at(k).position, before = at(k - 1).position, after = at(k + 1).position;
-		if (same(here, before) || same(here, after))
+		const here = at(k).position;
+		if (at(k).stop || same(here, at(k - 1).position) || same(here, at(k + 1).position))
 			return [0, 0, 0];
-		const span = unwrap(k + 1) - unwrap(k - 1);
-		return [0, 1, 2].map((c) => (after[c] - before[c]) / span);
+		const b = before(k), a = after(k);
+		return [0, 1, 2].map((c) => (a.position[c] - b.position[c]) / (a.time - b.time));
+	};
+	const hermite = (s, span, p0, m0, p1, m1) => {
+		const s2 = s * s, s3 = s2 * s;
+		const h00 = 2 * s3 - 3 * s2 + 1, h10 = s3 - 2 * s2 + s, h01 = -2 * s3 + 3 * s2, h11 = s3 - s2;
+		return p0.map((_, c) => h00 * p0[c] + h10 * span * m0[c] + h01 * p1[c] + h11 * span * m1[c]);
 	};
 
-	const s2 = s * s, s3 = s2 * s;
+	const p0 = at(i).position, p1 = at(i + 1).position;
+	const m0 = tangent(i), m1 = tangent(i + 1);
+	const through = viaOf(i);
 	let position;
 	if (through) {
-		// The quadratic through `through` at s = 1/2: its control point is that point's reflection of the
-		// segment's middle.
-		const q = [0, 1, 2].map((c) => 2 * through[c] - (p0[c] + p1[c]) / 2);
-		position = [0, 1, 2].map((c) => (1 - s) * (1 - s) * p0[c] + 2 * (1 - s) * s * q[c] + s2 * p1[c]);
+		// Two Hermite halves meeting at the via point half way through the segment, crossing it along the chord.
+		const half = dt / 2;
+		const mid = [0, 1, 2].map((c) => (p1[c] - p0[c]) / dt);
+		position = s < 0.5
+			? hermite(s * 2, half, p0, m0, through, mid)
+			: hermite(s * 2 - 1, half, through, mid, p1, m1);
 	} else {
-		const m0 = tangent(i), m1 = tangent(i + 1);
-		const h00 = 2 * s3 - 3 * s2 + 1, h10 = s3 - 2 * s2 + s, h01 = -2 * s3 + 3 * s2, h11 = s3 - s2;
-		position = [0, 1, 2].map((c) => h00 * p0[c] + h10 * dt * m0[c] + h01 * p1[c] + h11 * dt * m1[c]);
+		position = hermite(s, dt, p0, m0, p1, m1);
 	}
 
-	const ease = s2 * (3 - 2 * s);
-	const a0 = headingOf(at(i));
-	const spin = Number.isFinite(at(i).spin) ? at(i).spin : 0;
-	const heading = a0 + shortest(a0, headingOf(at(i + 1))) * ease + spin * 2 * Math.PI * s;
+	// The facing, counted on from the first key's so that it never jumps: each key turns the short way from the
+	// one before, plus the spin made on the way. It is eased the same way as the walk, so a juggler turning while
+	// they walk through a key keeps turning, and one who stops turning (a key facing the same way as a neighbour)
+	// eases in and out of it.
+	const turnTo = [0];
+	for (let k = 1; k <= n; k++) {
+		const spin = Number.isFinite(at(k - 1).spin) ? at(k - 1).spin : 0;
+		turnTo.push(turnTo[k - 1] + shortest(headingOf(at(k - 1)), headingOf(at(k))) + spin * 2 * Math.PI);
+	}
+	const lap = turnTo[n];
+	const facing = (k) => headingOf(keys[0]) + turnTo[((k % n) + n) % n] + Math.floor(k / n) * lap;
+	const turning = (k) => {
+		const here = facing(k), was = facing(k - 1), next = facing(k + 1);
+		if (at(k).stop || Math.abs(here - was) < EPS || Math.abs(here - next) < EPS)
+			return [0];
+		return [(next - was) / (unwrap(k + 1) - unwrap(k - 1))];
+	};
+	const a0 = facing(i);
+	const heading = headingOf(at(i)) + hermite(s, dt, [0], turning(i), [facing(i + 1) - a0], turning(i + 1))[0];
 
 	return { position, heading };
 }
