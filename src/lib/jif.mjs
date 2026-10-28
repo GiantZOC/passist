@@ -192,7 +192,14 @@ function _completeJugglerPath({ jif, warnings })
 			const lookAt = Array.isArray(key.lookAt) && key.lookAt.length >= 2 && key.lookAt.every((v) => typeof v == 'number')
 				? point(key.lookAt)
 				: juggler.lookAt.slice();
-			keys.push({ time: key.time, position: point(key.position), lookAt });
+			// `via` and `spin` are the walk's own words (path.mjs): kept as given, and dropped when malformed so a
+			// path still completes without them.
+			const clean = { time: key.time, position: point(key.position), lookAt };
+			if (Array.isArray(key.via) && key.via.length >= 2 && key.via.every((v) => typeof v == 'number' && isFinite(v)))
+				clean.via = point(key.via);
+			if (typeof key.spin == 'number' && isFinite(key.spin))
+				clean.spin = key.spin;
+			keys.push(clean);
 		});
 		if (!keys.length) {
 			warnings.push(`jugglers[${index}].path has no usable keys, removing it`);

@@ -9,6 +9,14 @@
  * (a point on a figure-eight) is crossed at the speed its neighbours give it, Catmull-Rom style, without a stop.
  * The facing turns the short way round between keys, eased the same.
  *
+ * A key can say two more things about the walk that leaves it:
+ *
+ *   via: [x, y, z]   a point the walk passes through on its way to the next key, for a curve round something
+ *                    standing in the way. It replaces the Hermite segment with the quadratic through the point
+ *                    at the segment's middle, so the walk bulges out and comes back rather than cutting across.
+ *   spin: 1          turns made getting to the next key, on top of the facing turning to wherever the next key
+ *                    looks — a pirouette while walking, and 0.5 ends facing the other way.
+ *
  * Pure arithmetic and no three.js, so the site that writes these paths can check them with the same code
  * (web/lib/pattern/stage.mjs keeps a copy, and a test there holds the two to the same answers).
  */
@@ -71,6 +79,9 @@ export function pathPose(path, time) {
 	const s = dt > 0 ? (now - t0) / dt : 0;
 
 	const p0 = at(i).position, p1 = at(i + 1).position;
+	// A `via` on the key the segment leaves bends it through that point; without one the walk is the Hermite.
+	const via = at(i).via;
+	const through = Array.isArray(via) && via.length == 3 && via.every(Number.isFinite) ? via : null;
 	const tangent = (k) => {
 		const here = at(k).position, before = at(k - 1).position, after = at(k + 1).position;
 		if (same(here, before) || same(here, after))
@@ -78,15 +89,24 @@ export function pathPose(path, time) {
 		const span = unwrap(k + 1) - unwrap(k - 1);
 		return [0, 1, 2].map((c) => (after[c] - before[c]) / span);
 	};
-	const m0 = tangent(i), m1 = tangent(i + 1);
 
 	const s2 = s * s, s3 = s2 * s;
-	const h00 = 2 * s3 - 3 * s2 + 1, h10 = s3 - 2 * s2 + s, h01 = -2 * s3 + 3 * s2, h11 = s3 - s2;
-	const position = [0, 1, 2].map((c) => h00 * p0[c] + h10 * dt * m0[c] + h01 * p1[c] + h11 * dt * m1[c]);
+	let position;
+	if (through) {
+		// The quadratic through `through` at s = 1/2: its control point is that point's reflection of the
+		// segment's middle.
+		const q = [0, 1, 2].map((c) => 2 * through[c] - (p0[c] + p1[c]) / 2);
+		position = [0, 1, 2].map((c) => (1 - s) * (1 - s) * p0[c] + 2 * (1 - s) * s * q[c] + s2 * p1[c]);
+	} else {
+		const m0 = tangent(i), m1 = tangent(i + 1);
+		const h00 = 2 * s3 - 3 * s2 + 1, h10 = s3 - 2 * s2 + s, h01 = -2 * s3 + 3 * s2, h11 = s3 - s2;
+		position = [0, 1, 2].map((c) => h00 * p0[c] + h10 * dt * m0[c] + h01 * p1[c] + h11 * dt * m1[c]);
+	}
 
 	const ease = s2 * (3 - 2 * s);
 	const a0 = headingOf(at(i));
-	const heading = a0 + shortest(a0, headingOf(at(i + 1))) * ease;
+	const spin = Number.isFinite(at(i).spin) ? at(i).spin : 0;
+	const heading = a0 + shortest(a0, headingOf(at(i + 1))) * ease + spin * 2 * Math.PI * s;
 
 	return { position, heading };
 }

@@ -158,6 +158,28 @@ test('a two-number path key is a place on the floor, as a position is', () => {
         assert.equal(jif.jugglers[0].path.keys.map((one) => one.position), [[1, 0, 2], [2, 0, 1]]);
 });
 
+test('a key\'s via point and spin are kept, and one that is not a point or a number is dropped', () => {
+        const { jif, warnings } = Jif.complete(solo3({
+                jugglers: [{
+                        name: 'A',
+                        position: [0, 0, 0],
+                        lookAt: [0, 0, 1],
+                        path: {
+                                period: 2,
+                                keys: [
+                                        { ...key(0, [0, 0, 0], [0, 0, 1]), via: [0.5, 1.5], spin: 1 },
+                                        { ...key(1, [1, 0, 0], [1, 0, 1]), via: [9], spin: 'twice' },
+                                ],
+                        },
+                }],
+        }));
+        assert.equal(warnings, []);
+        assert.equal(jif.jugglers[0].path.keys[0].via, [0.5, 0, 1.5]);
+        assert.equal(jif.jugglers[0].path.keys[0].spin, 1);
+        assert.not.ok('via' in jif.jugglers[0].path.keys[1], 'a via that is not a point is dropped');
+        assert.not.ok('spin' in jif.jugglers[0].path.keys[1], 'a spin that is not a number is dropped');
+});
+
 test('the juggler stands at the path\'s first key, not where the jif put them', () => {
         const { jif } = Jif.complete(solo3({
                 jugglers: [{ name: 'A', position: [9, 0, 9], lookAt: [9, 0, 9], path: { period: 2, keys: [key(0, [1, 0, 0], [1, 0, 1])] } }],

@@ -96,6 +96,31 @@ test('a pirouette is facing keys all the way round', () => {
 	close(Math.cos(again), Math.cos(start), 'the facing at the period');
 });
 
+test('a via point bends the walk through it, at the segment\'s middle', () => {
+        const path = { period: 2, keys: [{ ...key(0, 0, 0), via: [0, 0, 2] }, key(1, 2, 0)] };
+        const half = pathPose(path, 0.5);
+        close(half.position[0], 0, 'x at the middle is the via point, not the chord\'s middle');
+        close(half.position[2], 2, 'z at the middle is the via point');
+        const straight = pathPose({ period: 2, keys: [key(0, 0, 0), key(1, 2, 0)] }, 0.5);
+        assert.ok(Math.abs(straight.position[2]) < 1e-9, `a walk with no via stays on the line (${straight.position[2]})`);
+        close(pathPose(path, 1).position[0], 2, 'and the walk still reaches the next key');
+});
+
+test('a spin turns the juggler on the way round, on top of the facing', () => {
+        const path = { period: 2, keys: [{ ...key(0, 0), spin: 1 }, key(1, 2)] };
+        close(pathPose(path, 0).heading, 0, 'the key faces where it looks at its own time');
+        close(pathPose(path, 0.5).heading, Math.PI, 'half a turn at the segment\'s middle');
+        // Just before the next key, which is where the spin's whole turn has been made.
+        assert.ok(Math.abs(pathPose(path, 0.999).heading - 2 * Math.PI) < 0.02, 'a whole turn by the end');
+        close(pathPose(path, 2).heading, 0, 'and the cycle closes on the first key again');
+
+        // A spin adds to the turn to the next key's facing: facing +z then -z is half a turn already.
+        const both = { period: 2, keys: [{ ...key(0, 0, 0), spin: 0.5 }, facingKey(1, 180)] };
+        const end = pathPose(both, 0.999).heading;
+        assert.ok(Math.abs(Math.cos(end) - 1) < 0.02 && Math.abs(Math.sin(end)) < 0.02,
+                `half a turn to face the other way and half a spin is a whole turn (${end})`);
+});
+
 test('samples walk the cycle and stop before the repeat', () => {
 	const path = { period: 4, keys: [key(0, 0), key(1, 2), key(2, 2), key(3, 0)] };
 	const samples = pathSamples(path, 8);
