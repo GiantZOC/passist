@@ -2283,7 +2283,8 @@ async encodeCycles({ Muxer, Target, mime, container, config, cycles, frames, fps
 	const target = new Target();
 	const muxer = new Muxer({
 		target,
-		video: { codec: container, width, height, frameRate: fps },
+		// No frameRate: the muxer would use it as the timescale, quantising the exact end to 1/fps.
+		video: { codec: container, width, height },
 		...(mime === 'video/mp4' ? { fastStart: 'in-memory' } : {}),
 	});
 	let failure;
