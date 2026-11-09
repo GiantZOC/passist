@@ -53,6 +53,8 @@
 	let width;
 	let height;
 	let pixelRatio = 1;
+	let observer;
+	let inView = true;
 
 	const noop = () => {};
 	const maximize = () => {
@@ -82,6 +84,17 @@
 	const onFullscreenChange = e => {
 		isFullscreen = (document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement) === container;
 	};
+
+	// The loop only runs while the canvas is on screen and the tab is visible. Stopped, the phase is
+	// kept and the controls redraw a frame when the reader drags the view.
+	function syncActive() {
+		if (animation)
+			animation.setActive(inView && document.visibilityState !== 'hidden');
+	}
+	function onVisibilityChange() {
+		syncActive();
+	}
+
 	onMount(async () => {
 		const Animation = (await import('./animation.mjs')).default; // dynamic import, only on browser
 		await Animation.loadModels(jugglerModels);
@@ -104,6 +117,18 @@
 		};
 		loaded = true;
 		fpsInterval = setInterval(() => fps = animation.fps, 1000);
+
+		// A canvas scrolled out of view costs nothing while it is away; the first observer callback
+		// lands after the browser has laid the page out, so the loop may run a frame or two first.
+		if (typeof IntersectionObserver !== 'undefined') {
+			observer = new IntersectionObserver((entries) => {
+				inView = entries.some((entry) => entry.isIntersecting);
+				syncActive();
+			}, { threshold: 0 });
+			observer.observe(container);
+		}
+		document.addEventListener('visibilitychange', onVisibilityChange);
+		syncActive();
 
 		requestFullscreen = () => {
 			const requestFS = (
@@ -155,8 +180,15 @@
 		if (fpsInterval)
 			clearInterval(fpsInterval);
 
-		if (browser === true)
+		if (observer) {
+			observer.disconnect();
+			observer = undefined;
+		}
+
+		if (browser === true) {
 			document.removeEventListener("fullscreenchange", onFullscreenChange);
+			document.removeEventListener("visibilitychange", onVisibilityChange);
+		}
 	});
 
 	$: if (browser === true && animation) { animation.updateScene(animationJif, animationOptions); }

@@ -7,6 +7,8 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { pathPose, pathSamples } from './path.mjs';
 import { fromBody, handSteps, toBody } from './hands.mjs';
 import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
+import { Muxer as Mp4Muxer, ArrayBufferTarget as Mp4Target } from 'mp4-muxer';
+import { Muxer as WebmMuxer, ArrayBufferTarget as WebmTarget } from 'webm-muxer';
 
 const hu = 0.21;
 const jugglerHeight  = 8    * hu;
@@ -58,6 +60,103 @@ function sideFactor(side)
 function v3(x, y, z)
 {
 	return new THREE.Vector3(x, y, z);
+}
+
+// Per-frame scratch. Every prop and every hand is posed again each frame, so vectors and quaternions
+// that live only inside one call are reused instead of allocated. The names are grouped by the call
+// path that owns them; none is read after a call that can overwrite it.
+const _UP = new THREE.Vector3(0, 1, 0);
+
+const _holdPoint = new THREE.Vector3();
+const _holdPoint2 = new THREE.Vector3();
+const _holdRotation = new THREE.Quaternion();
+const _hold = { position: _holdPoint, prop: undefined, rotation: undefined, ball: false, closure: 0, ready: undefined };
+const _grip = { offset: new THREE.Vector3(), rotation: new THREE.Quaternion(), hasRotation: false, ball: false };
+const _gripFrom = { offset: new THREE.Vector3(), rotation: new THREE.Quaternion(), hasRotation: false, ball: false };
+const _gripTo = { offset: new THREE.Vector3(), rotation: new THREE.Quaternion(), hasRotation: false, ball: false };
+const _delta = new THREE.Vector3();
+const _handPos = new THREE.Vector3();
+const _rotation = new THREE.Quaternion();
+
+const _bodyLocal = new THREE.Vector3();
+const _bodyScale = new THREE.Vector3();
+const _clear = new THREE.Vector3();
+
+const _shElbow = new THREE.Vector3();
+const _shElbow2 = new THREE.Vector3();
+const _shForearm = new THREE.Vector3();
+const _shWristTarget = new THREE.Vector3();
+const _shGripOffset = new THREE.Vector3();
+const _shToward = new THREE.Vector3();
+const _shUp = new THREE.Vector3();
+const _shParent = new THREE.Quaternion();
+const _shLocal = new THREE.Quaternion();
+const _shHand = new THREE.Quaternion();
+const _shRelax = new THREE.Quaternion();
+const _shFingerTurn = new THREE.Quaternion();
+
+const _hrAcross = new THREE.Vector3();
+const _hrFromForearm = new THREE.Vector3();
+const _hrDown = new THREE.Vector3();
+const _hrAlong = new THREE.Vector3();
+const _hrNormal = new THREE.Vector3();
+const _hrInward = new THREE.Vector3();
+const _hrFacing = new THREE.Vector3();
+const _hrBasis = new THREE.Matrix4();
+const _hrRest = new THREE.Matrix4();
+
+const _reachShoulder = new THREE.Vector3();
+const _reachToHand = new THREE.Vector3();
+const _reachReached = new THREE.Vector3();
+const _reachPole = new THREE.Vector3();
+const _reachPole2 = new THREE.Vector3();
+const _reachElbow = new THREE.Vector3();
+const _reachLower = new THREE.Vector3();
+const _reachElbowMinus = new THREE.Vector3();
+const _reachElbowNow = new THREE.Vector3();
+const _reachEffector = new THREE.Vector3();
+const _aimTurn = new THREE.Quaternion();
+const _rwWorld = new THREE.Quaternion();
+const _rwParent = new THREE.Quaternion();
+const _twistNormal = new THREE.Vector3();
+const _twistWorld = new THREE.Quaternion();
+const _twistGoal = new THREE.Vector3();
+const _twistCross = new THREE.Vector3();
+const _twistTurn = new THREE.Quaternion();
+
+const _curlTip = new THREE.Vector3();
+const _curlTurn = new THREE.Quaternion();
+const CURL_AXES = [v3(1, 0, 0), v3(-1, 0, 0), v3(0, 1, 0), v3(0, -1, 0), v3(0, 0, 1), v3(0, 0, -1)];
+
+const _dwellAxis = new THREE.Vector3();
+const _dwellAxis2 = new THREE.Vector3();
+const _dwellPoint = new THREE.Vector3();
+const _carriedHeading = new THREE.Quaternion();
+const _linearPoint = new THREE.Vector3();
+const _linearPoint2 = new THREE.Vector3();
+
+// One material per prop colour and one club texture per colour, shared by every prop and orbit that
+// uses them. The materials are immutable after they are made, so a rebuilt scene reuses them.
+const clubTextures = new Map();
+const propMaterials = new Map();
+
+function clubTextureFor(color)
+{
+	let texture = clubTextures.get(color);
+	if (!texture)
+		clubTextures.set(color, texture = Animation.clubTexture({ body: color }));
+	return texture;
+}
+
+function propMaterialFor(color, textured)
+{
+	const key = `${textured ? 'club' : 'plain'}:${color}`;
+	let material = propMaterials.get(key);
+	if (!material) {
+		material = new THREE.MeshToonMaterial(textured ? { map: clubTextureFor(color) } : { color });
+		propMaterials.set(key, material);
+	}
+	return material;
 }
 
 function pirouetteGeometry()
@@ -711,23 +810,24 @@ get facing()
  * cylinder, from the hips' height to the shoulders', and a point inside it pushed straight out sideways
  * and back to its edge, the way an arm swings past a hip rather than through it.
  */
-clearOfBody(position)
+clearOfBody(position, target = _clear)
 {
 	const { width, top, bottom } = this.layout;
 	this.updateMatrixWorld();
-	const local = this.worldToLocal(position.clone());
+	const local = _bodyLocal.copy(position);
+	this.worldToLocal(local);
 	if (local.y > top || local.y < bottom)
-		return position;
+		return target.copy(position);
 	const rx = width + 0.07;
 	const rz = 0.16;
 	const inside = Math.hypot(local.x / rx, local.z / rz);
 	if (inside >= 1)
-		return position;
+		return target.copy(position);
 	if (inside < 1e-6)
 		local.z = rz;
 	else
-		local.multiply(v3(1 / inside, 1, 1 / inside));
-	return this.localToWorld(local);
+		local.multiply(_bodyScale.set(1 / inside, 1, 1 / inside));
+	return target.copy(this.localToWorld(local));
 }
 
 /** A point given in the juggler's own frame, for `side`'s hand: x is towards the body's middle. */
@@ -766,11 +866,11 @@ static curlAxis(juggler, bones, tip, goal)
 {
 	const rest = bones.map(one => one.quaternion.clone());
 	let best, nearest = Infinity;
-	for (const axis of [v3(1, 0, 0), v3(-1, 0, 0), v3(0, 1, 0), v3(0, -1, 0), v3(0, 0, 1), v3(0, 0, -1)]) {
-		const turn = new THREE.Quaternion().setFromAxisAngle(axis, 0.9);
+	for (const axis of CURL_AXES) {
+		const turn = _curlTurn.setFromAxisAngle(axis, 0.9);
 		bones.forEach((one, i) => one.quaternion.copy(rest[i]).multiply(turn));
 		juggler.updateMatrixWorld(true);
-		const distance = tip.getWorldPosition(new THREE.Vector3()).distanceTo(goal);
+		const distance = tip.getWorldPosition(_curlTip).distanceTo(goal);
 		if (distance < nearest) {
 			nearest = distance;
 			best = axis;
@@ -796,41 +896,41 @@ setHandPosition(side, handPos, hold)
 	this.reach(arm, side, handPos, arm.palm, arm.lowerLength);
 
 	if (!hold) {
-		const elbow = arm.lower.getWorldPosition(new THREE.Vector3());
-		this.twist(arm, handPos.clone().sub(elbow).normalize(), v3(0, 1, 0));
+		const elbow = arm.lower.getWorldPosition(_shElbow);
+		this.twist(arm, _shForearm.copy(handPos).sub(elbow).normalize(), _shUp.set(0, 1, 0));
 		return;
 	}
 
 	// The hand turned to what it holds, from where the forearm points when the palm reaches for it.
-	const elbow = arm.lower.getWorldPosition(new THREE.Vector3());
-	const forearmDir = arm.palm.getWorldPosition(new THREE.Vector3()).sub(elbow).normalize();
-	const hand = this.handRotation(arm, side, forearmDir, hold);
+	const elbow = arm.lower.getWorldPosition(_shElbow);
+	const forearmDir = arm.palm.getWorldPosition(_shForearm).sub(elbow).normalize();
+	const hand = this.handRotation(arm, side, forearmDir, hold, _shHand);
 	if (hold.ready > 0)
-		hand.slerp(this.handRotation(arm, side, forearmDir, {}), hold.ready);
+		hand.slerp(this.handRotation(arm, side, forearmDir, {}, _shRelax), hold.ready);
 
 	// Again, now reaching with the wrist for where it must be to put the handle in that hand.
 	arm.upper.quaternion.copy(arm.rest[0]);
 	arm.lower.quaternion.copy(arm.rest[1]);
 	this.updateMatrixWorld(true);
-	const wristTarget = handPos.clone().sub(arm.gripOffset.clone().applyQuaternion(hand));
+	const wristTarget = _shWristTarget.copy(handPos).sub(_shGripOffset.copy(arm.gripOffset).applyQuaternion(hand));
 	this.reach(arm, side, wristTarget, arm.wrist, arm.wristLength);
 
 	// The forearm takes the turn about its own length, so the wrist only has to bend.
-	const forearm = arm.wrist.getWorldPosition(new THREE.Vector3()).sub(arm.lower.getWorldPosition(new THREE.Vector3())).normalize();
-	this.twist(arm, forearm, arm.frame[2].clone().applyQuaternion(hand));
+	const forearm = _shForearm.copy(arm.wrist.getWorldPosition(_shElbow)).sub(arm.lower.getWorldPosition(_shElbow2)).normalize();
+	this.twist(arm, forearm, _shToward.copy(arm.frame[2]).applyQuaternion(hand));
 
 	// The wrist turned the rest of the way, but no further than a wrist bends.
-	const parent = arm.wrist.parent.getWorldQuaternion(new THREE.Quaternion()).invert();
-	const local = parent.multiply(hand);
+	const parent = arm.wrist.parent.getWorldQuaternion(_shParent).invert();
+	const local = _shLocal.copy(parent).multiply(hand);
 	const bend = 2 * Math.acos(Math.min(1, Math.abs(arm.rest[2].dot(local))));
 	arm.wrist.quaternion.copy(arm.rest[2]).slerp(local, bend > maxWristBend ? maxWristBend / bend : 1);
 
 	// The fingers round the handle; round a ball, only cupped.
 	const closure = hold.closure * (hold.ball ? 0.4 : 1);
 	arm.fingers.forEach((one, i) => one.quaternion.copy(arm.rest[3 + i])
-		.multiply(new THREE.Quaternion().setFromAxisAngle(arm.fingerAxis, closure * fingerCurl[i % 3])));
+		.multiply(_shFingerTurn.setFromAxisAngle(arm.fingerAxis, closure * fingerCurl[i % 3])));
 	arm.thumb.forEach((one, i) => one.quaternion.copy(arm.rest[3 + arm.fingers.length + i])
-		.multiply(new THREE.Quaternion().setFromAxisAngle(arm.thumbAxis, closure * thumbCurl[i])));
+		.multiply(_shFingerTurn.setFromAxisAngle(arm.thumbAxis, closure * thumbCurl[i])));
 }
 
 /**
@@ -838,36 +938,35 @@ setHandPosition(side, handPos, hold)
  * its head out past the index finger, and the fingers carrying on from the forearm as nearly as that
  * allows. Holding nothing, or a ball, the palm is open and up, turned a little in.
  */
-handRotation(arm, side, forearm, hold)
+handRotation(arm, side, forearm, hold, target = new THREE.Quaternion())
 {
 	const [alongRest, acrossRest, normalRest] = arm.frame;
 	const h = arm.handedness;
-	const down = v3(0, -1, 0);
 	let along, across, normal;
 	if (hold.rotation && !hold.ball) {
-		across = v3(0, 1, 0).applyQuaternion(hold.rotation);
+		across = _hrAcross.set(0, 1, 0).applyQuaternion(hold.rotation);
 		// The forearm's own direction across the club, leaning on straight down as the two come into line,
 		// where the forearm alone says nothing and the hand would flip.
-		const fromForearm = forearm.clone().projectOnPlane(across);
+		const fromForearm = _hrFromForearm.copy(forearm).projectOnPlane(across);
 		const sure = Math.min(1, fromForearm.length() / 0.5);
 		along = fromForearm.normalize().multiplyScalar(sure)
-			.add(down.clone().projectOnPlane(across).normalize().multiplyScalar(1 - sure));
+			.add(_hrDown.set(0, -1, 0).projectOnPlane(across).normalize().multiplyScalar(1 - sure));
 		if (along.lengthSq() < 1e-6)
-			along = this.facing.projectOnPlane(across);
+			along = _hrAlong.copy(_hrFacing.set(0, 0, 1).applyQuaternion(this.quaternion)).projectOnPlane(across);
 		along.normalize();
-		normal = along.clone().cross(across).multiplyScalar(h);
+		normal = _hrNormal.copy(along).cross(across).multiplyScalar(h);
 	} else {
-		const inward = v3(-sideFactor(side), 0, 0).applyQuaternion(this.quaternion);
-		normal = v3(0, 1, 0).addScaledVector(inward, 0.5).normalize();
-		along = forearm.clone().projectOnPlane(normal);
+		const inward = _hrInward.set(-sideFactor(side), 0, 0).applyQuaternion(this.quaternion);
+		normal = _hrNormal.set(0, 1, 0).addScaledVector(inward, 0.5).normalize();
+		along = _hrAlong.copy(forearm).projectOnPlane(normal);
 		if (along.lengthSq() < 1e-4)
-			along = this.facing.projectOnPlane(normal);
+			along = _hrAlong.copy(_hrFacing.set(0, 0, 1).applyQuaternion(this.quaternion)).projectOnPlane(normal);
 		along.normalize();
-		across = normal.clone().cross(along).multiplyScalar(h);
+		across = _hrAcross.copy(normal).cross(along).multiplyScalar(h);
 	}
-	const target = new THREE.Matrix4().makeBasis(along, across, normal);
-	const rest = new THREE.Matrix4().makeBasis(alongRest, acrossRest, normalRest).transpose();
-	return new THREE.Quaternion().setFromRotationMatrix(target.multiply(rest));
+	const basis = _hrBasis.makeBasis(along, across, normal);
+	const rest = _hrRest.makeBasis(alongRest, acrossRest, normalRest).transpose();
+	return target.setFromRotationMatrix(basis.multiply(rest));
 }
 
 /**
@@ -877,53 +976,53 @@ handRotation(arm, side, forearm, hold)
  */
 reach(arm, side, target, effector, lowerLength)
 {
-	const shoulder = arm.upper.getWorldPosition(new THREE.Vector3());
+	const shoulder = arm.upper.getWorldPosition(_reachShoulder);
 	const a = arm.upperLength;
 	const b = lowerLength;
-	const toHand = target.clone().sub(shoulder);
+	const toHand = _reachToHand.copy(target).sub(shoulder);
 	const d = THREE.MathUtils.clamp(toHand.length(), Math.abs(a - b) + 1e-3, a + b - 1e-3);
 	const dir = toHand.normalize();
-	const reached = shoulder.clone().addScaledVector(dir, d);
+	const reached = _reachReached.copy(shoulder).addScaledVector(dir, d);
 
 	const along = (a * a - b * b + d * d) / (2 * d);
 	const out = Math.sqrt(Math.max(0, a * a - along * along));
-	const pole = dir.clone().cross(
-		v3(-1, 0.3 * -sideFactor(side), 0).normalize().applyQuaternion(this.quaternion)
+	const pole = _reachPole.copy(dir).cross(
+		_reachPole2.set(-1, 0.3 * -sideFactor(side), 0).normalize().applyQuaternion(this.quaternion)
 	).normalize();
-	const elbow = shoulder.clone().addScaledVector(dir, along).addScaledVector(pole, out);
+	const elbow = _reachElbow.copy(shoulder).addScaledVector(dir, along).addScaledVector(pole, out);
 
-	ModelJuggler.aim(arm.upper, arm.lower.getWorldPosition(new THREE.Vector3()).sub(shoulder), elbow.clone().sub(shoulder));
+	ModelJuggler.aim(arm.upper, arm.lower.getWorldPosition(_reachLower).sub(shoulder), _reachElbowMinus.copy(elbow).sub(shoulder));
 	arm.upper.updateMatrixWorld(true);
-	const elbowNow = arm.lower.getWorldPosition(new THREE.Vector3());
-	ModelJuggler.aim(arm.lower, effector.getWorldPosition(new THREE.Vector3()).sub(elbowNow), reached.sub(elbowNow));
+	const elbowNow = arm.lower.getWorldPosition(_reachElbowNow);
+	ModelJuggler.aim(arm.lower, effector.getWorldPosition(_reachEffector).sub(elbowNow), reached.sub(elbowNow));
 	arm.lower.updateMatrixWorld(true);
 }
 
 /** Turn the forearm about `axis`, its own length, until the palm faces as near `toward` as it can. */
 twist(arm, axis, toward)
 {
-	const normal = arm.frame[2].clone()
-		.applyQuaternion(arm.wrist.getWorldQuaternion(new THREE.Quaternion()))
+	const normal = _twistNormal.copy(arm.frame[2])
+		.applyQuaternion(arm.wrist.getWorldQuaternion(_twistWorld))
 		.projectOnPlane(axis);
-	const goal = toward.clone().projectOnPlane(axis);
+	const goal = _twistGoal.copy(toward).projectOnPlane(axis);
 	if (normal.lengthSq() < 1e-6 || goal.lengthSq() < 1e-6)
 		return;
-	const angle = Math.atan2(normal.clone().cross(goal).dot(axis), normal.dot(goal));
-	ModelJuggler.rotateWorld(arm.lower, new THREE.Quaternion().setFromAxisAngle(axis, angle));
+	const angle = Math.atan2(_twistCross.copy(normal).cross(goal).dot(axis), normal.dot(goal));
+	ModelJuggler.rotateWorld(arm.lower, _twistTurn.setFromAxisAngle(axis, angle));
 	arm.lower.updateMatrixWorld(true);
 }
 
 /** Turn a bone so that `from`, a world direction it carries, points along `to`. */
 static aim(bone, from, to)
 {
-	ModelJuggler.rotateWorld(bone, new THREE.Quaternion().setFromUnitVectors(from.normalize(), to.normalize()));
+	ModelJuggler.rotateWorld(bone, _aimTurn.setFromUnitVectors(from.normalize(), to.normalize()));
 }
 
 /** Apply a rotation given in world space to a bone. */
 static rotateWorld(bone, rotation)
 {
-	const world = bone.getWorldQuaternion(new THREE.Quaternion());
-	const parent = bone.parent.getWorldQuaternion(new THREE.Quaternion());
+	const world = bone.getWorldQuaternion(_rwWorld);
+	const parent = bone.parent.getWorldQuaternion(_rwParent);
 	bone.quaternion.copy(parent.invert().multiply(rotation.multiply(world)));
 }
 
@@ -1024,9 +1123,9 @@ getRotation(t, optionalTarget)
 	const target = optionalTarget || new THREE.Quaternion();
 	if (this.rotationCurve) {
 		return target.setFromAxisAngle(
-			this.catchAxis.clone().multiplyScalar(1 - t)
-				.add(this.throwAxis.clone().multiplyScalar(t)),
-			this.rotationCurve.getPoint(t).x
+			_dwellAxis.copy(this.catchAxis).multiplyScalar(1 - t)
+				.add(_dwellAxis2.copy(this.throwAxis).multiplyScalar(t)),
+			this.rotationCurve.getPoint(t, _dwellPoint).x
 		);
 	}
 	return undefined;
@@ -1084,7 +1183,7 @@ getRotation(t, optionalTarget)
 	const rotation = super.getRotation(t, optionalTarget);
 	if (!rotation)
 		return rotation;
-	const heading = new THREE.Quaternion().setFromAxisAngle(v3(0, 1, 0), this.poseAt(t).heading);
+	const heading = _carriedHeading.setFromAxisAngle(_UP, this.poseAt(t).heading);
 	return rotation.premultiply(heading);
 }
 
@@ -1143,8 +1242,8 @@ getPoint(t, optionalTarget)
 {
 	const target = optionalTarget || new THREE.Vector3();
 	return target.copy(
-		this.fromPoint.clone().multiplyScalar(1 - t)
-			.add(this.toPoint.clone().multiplyScalar(t))
+		_linearPoint.copy(this.fromPoint).multiplyScalar(1 - t)
+			.add(_linearPoint2.copy(this.toPoint).multiplyScalar(t))
 	);
 }
 
@@ -1237,9 +1336,16 @@ constructor(canvas, jif, animationOptions, sizeOptions)
 	this.controls = new OrbitControls( this.camera, this.renderer.domElement );
 	this.controls.enableKeys = false;
 	this.controls.maxDistance = 100;
+	// A stopped loop (off-screen, or a hidden tab) still has to redraw when the reader drags the view.
+	this.controls.addEventListener('change', () => {
+		if (!this.active)
+			this.render();
+	});
 
 	this.timer = {dt: 0};
 	this.paused = false;
+	this.active = true;
+	this.boundAnimate = this.animate.bind(this);
 
 	this.scenery = sceneries[animationOptions.scenery] || sceneries.passist;
 	this.grassTileMesh = Animation.createGroundMesh(this.scenery.ground);
@@ -1536,13 +1642,11 @@ updateScene(jif, options)
 		const mesh = type == 'ball' ?
 			new THREE.Mesh(
 				new THREE.SphereGeometry( 0.04, 10, 10 ),
-				new THREE.MeshToonMaterial({color: color} )
+				propMaterialFor(color, false)
 			)
 			: new THREE.Mesh(
 				this.clubGeometry,
-				new THREE.MeshToonMaterial({
-					map: Animation.clubTexture({body: color})
-				})
+				propMaterialFor(color, true)
 			);
 		this.props.push({
 			mesh: mesh,
@@ -1665,7 +1769,7 @@ updateScene(jif, options)
 			if (options.showOrbits) {
 				this.scene.add(new THREE.Mesh(
 					new THREE.TubeGeometry(t.throwCurve, 32, 0.01, 16, false),
-					new THREE.MeshToonMaterial({ color:propColor(jif.props[t.prop], jif) }),
+					propMaterialFor(propColor(jif.props[t.prop], jif), false),
 				));
 			}
 		}
@@ -1714,7 +1818,7 @@ updateScene(jif, options)
 				if (options.showOrbits)
 					this.scene.add(new THREE.Mesh(
 						new THREE.TubeGeometry(dwellCurve, 32, 0.01, 16, false),
-						new THREE.MeshToonMaterial({ color:propColor(jif.props[prop], jif) }),
+						propMaterialFor(propColor(jif.props[prop], jif), false),
 					));
 				positionCurves.push(dwellCurve);
 			}
@@ -1763,6 +1867,9 @@ updateScene(jif, options)
 
 animate()
 {
+	if (!this.active)
+		return;
+
 	const jif = this.jif;
 
 	const t = performance.now(); // web page time [ms]
@@ -1781,13 +1888,40 @@ animate()
 		this.prevTime = t;
 	}
 
-	this.animationFrameRequestId = requestAnimationFrame(this.animate.bind(this));
+	this.animationFrameRequestId = requestAnimationFrame(this.boundAnimate);
 	this.controls.update();
 
 	if (jif && this.props && !this.paused)
 		this.setPositions((time / 1000 * this.options.animationSpeed) % this.periodSeconds);
 
+	this.render();
+}
+
+/** Draw one frame. The live loop does this every frame; while it is stopped, the controls do. */
+render()
+{
 	this.renderer.render(this.scene, this.camera);
+}
+
+/**
+ * Start or stop the live loop. Stopped, the loop is cancelled and the phase is kept in `timer.dt`, so
+ * the animation resumes where it left off rather than counting the time it was away. The widget calls
+ * this when the canvas leaves the viewport or the tab hides; a drag still redraws through `render`.
+ */
+setActive(active)
+{
+	active = !!active;
+	if (active === this.active)
+		return;
+	this.active = active;
+	if (active) {
+		this.timer.starttime = undefined; // resume from timer.dt, not from the wall clock
+		this.prevTime = undefined;
+		this.animate();
+	} else {
+		cancelAnimationFrame(this.animationFrameRequestId);
+		this.animationFrameRequestId = null;
+	}
 }
 
 /**
@@ -1805,7 +1939,7 @@ setPositions(t)
 		if (p.movement.getPosition(t, p.mesh.position))
 			visible = true;
 
-		let quaternion = p.movement.getRotation(t);
+		let quaternion = p.movement.getRotation(t, _rotation);
 		if (quaternion)
 			p.mesh.setRotationFromQuaternion(quaternion);
 
@@ -1819,14 +1953,14 @@ setPositions(t)
 				continue;
 			// Passist's scoop swings a club down past the hip; a body in the way moves the hand round it,
 			// and the club it holds with it.
-			const clear = hand.juggler.clearOfBody(hold.position);
+			const clear = hand.juggler.clearOfBody(hold.position, _clear);
 			if (hold.prop !== undefined)
-				this.props[hold.prop].mesh.position.add(clear.clone().sub(hold.position));
+				this.props[hold.prop].mesh.position.add(_delta.subVectors(clear, hold.position));
 			hold.position = clear;
 			hand.juggler.setHandPosition(hand.side, hold.position, hold);
 			continue;
 		}
-		const handPos = hand.movement.getPosition(t);
+		const handPos = hand.movement.getPosition(t, _handPos);
 		if (handPos)
 			hand.juggler.setHandPosition(hand.side, handPos);
 	}
@@ -1847,38 +1981,50 @@ holdAt(hand, t)
 		return undefined;
 	const { curve, fraction } = cf;
 	const ease = x => { const c = THREE.MathUtils.clamp(x, 0, 1); return c * c * (3 - 2 * c); };
+	const hold = _hold;
 	if (curve.type == 'DwellCurve') {
-		const grip = this.gripOf(curve, fraction);
-		return {
-			position: curve.getPoint(fraction).add(grip.offset),
-			prop: curve.prop,
-			rotation: grip.rotation,
-			ball: grip.ball,
-			closure: ease(((curve.held ?? 0) + fraction * curve.duration) / gripCloseSeconds),
-		};
+		const grip = this.gripOf(curve, fraction, _grip);
+		curve.getPoint(fraction, _holdPoint).add(grip.offset);
+		hold.position = _holdPoint;
+		hold.prop = curve.prop;
+		hold.rotation = grip.hasRotation ? grip.rotation : undefined;
+		hold.ball = grip.ball;
+		hold.ready = undefined;
+		hold.closure = ease(((curve.held ?? 0) + fraction * curve.duration) / gripCloseSeconds);
+		return hold;
 	}
-	const from = this.gripOf(curve.before, 1);
-	const to = this.gripOf(curve.after, 0);
+	const from = this.gripOf(curve.before, 1, _gripFrom);
+	const to = this.gripOf(curve.after, 0, _gripTo);
 	// Empty, the hand eases into a relaxed open palm, and back to the next club's angle as it arrives.
 	const elapsed = fraction * curve.duration;
 	const left = (1 - fraction) * curve.duration;
-	return {
-		ready: Math.min(ease(elapsed / gripReadySeconds), ease(left / gripReadySeconds)),
-		position: curve.before.throwPos.clone().add(from.offset)
-			.lerp(curve.after.catchPos.clone().add(to.offset), fraction),
-		rotation: from.rotation && to.rotation ? from.rotation.clone().slerp(to.rotation, fraction) : undefined,
-		ball: from.ball,
-		closure: 1 - ease(fraction * curve.duration / gripOpenSeconds),
-	};
+	hold.ready = Math.min(ease(elapsed / gripReadySeconds), ease(left / gripReadySeconds));
+	_holdPoint.copy(curve.before.throwPos).add(from.offset)
+		.lerp(_holdPoint2.copy(curve.after.catchPos).add(to.offset), fraction);
+	hold.position = _holdPoint;
+	hold.prop = undefined;
+	hold.rotation = from.hasRotation && to.hasRotation
+		? _holdRotation.copy(from.rotation).slerp(to.rotation, fraction)
+		: undefined;
+	hold.ball = from.ball;
+	hold.closure = 1 - ease(fraction * curve.duration / gripOpenSeconds);
+	return hold;
 }
 
 /** The handle's offset from a club's middle, and the club's rotation, at a point of a dwell. */
-gripOf(dwell, fraction)
+gripOf(dwell, fraction, target)
 {
-	const rotation = dwell.getRotation(fraction);
-	if (this.props[dwell.prop].type == 'ball' || !rotation)
-		return { offset: v3(0, 0, 0), rotation: undefined, ball: true };
-	return { offset: v3(0, -clubGrip, 0).applyQuaternion(rotation), rotation, ball: false };
+	const rotation = dwell.getRotation(fraction, target.rotation);
+	if (this.props[dwell.prop].type == 'ball' || !rotation) {
+		target.offset.set(0, 0, 0);
+		target.hasRotation = false;
+		target.ball = true;
+		return target;
+	}
+	target.offset.set(0, -clubGrip, 0).applyQuaternion(rotation);
+	target.hasRotation = true;
+	target.ball = false;
+	return target;
 }
 
 /** Stands juggler `index` at a pose from path.mjs: `{ position, heading }`. */
@@ -2018,6 +2164,7 @@ beginExport({ width, height })
 	};
 
 	cancelAnimationFrame(this.animationFrameRequestId);
+	this.animationFrameRequestId = null;
 	this.resize({ width, height, pixelRatio: 1 });
 	this.controls.enabled = false;
 	this.paused = false;
@@ -2033,7 +2180,10 @@ beginExport({ width, height })
 			this.paused = state.paused;
 			this.exporting = null;
 			this.setTime(this.timer.dt / 1000 * this.options.animationSpeed % this.periodSeconds);
-			this.animate(); // the live loop resumes where it was
+			if (this.active)
+				this.animate(); // the live loop resumes where it was
+			else
+				this.render();
 		},
 	};
 }
@@ -2074,20 +2224,126 @@ static stamp(ctx, text, width, height, right = '')
  * Deliberately not a recording of the visible canvas: the viewer's window is whatever size it happens
  * to be, and a phone's export should not be a phone's size. So the frames are drawn into the widget's
  * canvas at the export size and copied into a 2D canvas of that size in the same task - the one moment
- * a canvas with `preserveDrawingBuffer: false` is guaranteed readable - and that canvas is what the
- * recorder sees. The scene is drawn from an explicit frame number rather than from wall-clock time, so
- * frame N is the same animation state in every clip.
+ * a canvas with `preserveDrawingBuffer: false` is guaranteed readable.
  *
- * The frames are fed on a wall-clock schedule, because `MediaRecorder` stamps each frame with the time
- * it arrived: a clip is as long as the drawing of it took. A background tab throttles that schedule and
- * the clip comes out slow, so this is a foreground-tab feature.
+ * Where the browser has WebCodecs the frames are encoded with an explicit timestamp each and muxed
+ * into an MP4 or WebM: the export runs as fast as the encoder can take frames, needs no wall clock and
+ * works in a background tab. `MediaRecorder` is the fallback; it stamps each frame with the time it
+ * arrived, so that path is only as good as a foreground tab's frame schedule.
  */
 async recordCycles({ cycles = 2, fps = 30, width = 960, height = 540, stamp = '', stampRight = '', onProgress } = {})
 {
+	const perFrame = 1000 / fps;
+	const frames = Math.max(1, Math.round(cycles * this.cycleDuration() / perFrame));
+	const codec = await Animation.videoCodec({ width, height, fps });
+	if (codec) {
+		try {
+			return await this.encodeCycles({ ...codec, cycles, frames, fps, width, height, stamp, stampRight, onProgress });
+		} catch (err) {
+			console.warn('WebCodecs export failed, recording with MediaRecorder', err);
+		}
+	}
+	return this.recordWithMediaRecorder({ frames, fps, width, height, stamp, stampRight, onProgress });
+}
+
+/**
+ * The first codec this browser can encode and the muxer that writes it: WebM/VP9 where it is
+ * supported (the format the page has always offered), MP4/H.264 next (Safari has no VP9 encoder), or
+ * null when WebCodecs can encode neither and `MediaRecorder` has to take over.
+ */
+static async videoCodec({ width, height, fps })
+{
+	if (typeof VideoEncoder === 'undefined' || typeof VideoFrame === 'undefined'
+		|| typeof VideoEncoder.isConfigSupported !== 'function')
+		return null;
+	const candidates = [
+		{ mime: 'video/webm', Muxer: WebmMuxer, Target: WebmTarget, codec: 'vp09.00.10.08', container: 'V_VP9' },
+		{ mime: 'video/webm', Muxer: WebmMuxer, Target: WebmTarget, codec: 'vp8', container: 'V_VP8' },
+		{ mime: 'video/mp4', Muxer: Mp4Muxer, Target: Mp4Target, codec: 'avc1.42001f', container: 'avc' },
+	];
+	for (const candidate of candidates) {
+		const config = { codec: candidate.codec, width, height, bitrate: 4_000_000, framerate: fps };
+		try {
+			const support = await VideoEncoder.isConfigSupported(config);
+			if (support.supported)
+				return { ...candidate, config };
+		} catch (err) {
+			// Some browsers throw on a codec string they do not know rather than reporting it unsupported.
+		}
+	}
+	return null;
+}
+
+/**
+ * Encode `frames` frames with WebCodecs and mux them into one file. Timestamps come from the frame
+ * number, and the last frame's duration closes the clip on exactly `cycles * cycleDuration()`.
+ */
+async encodeCycles({ Muxer, Target, mime, container, config, cycles, frames, fps, width, height, stamp, stampRight, onProgress })
+{
+	const target = new Target();
+	const muxer = new Muxer({
+		target,
+		video: { codec: container, width, height, frameRate: fps },
+		...(mime === 'video/mp4' ? { fastStart: 'in-memory' } : {}),
+	});
+	let failure;
+	const encoder = new VideoEncoder({
+		output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+		error: (err) => { failure = err; },
+	});
+	encoder.configure(config);
+
+	const out = document.createElement('canvas');
+	out.width = width;
+	out.height = height;
+	const ctx = out.getContext('2d');
+
+	const export_ = this.beginExport({ width, height });
+	this.exporting = export_;
+	const perFrame = 1000 / fps;
+	const total = Math.round(cycles * this.cycleDuration() * 1000);
+	const keyEvery = Math.max(1, Math.round(fps * 2));
+	try {
+		for (let frame = 0; frame < frames; frame++) {
+			if (failure)
+				throw failure;
+			this.setTime(frame * perFrame / 1000 * this.options.animationSpeed % this.periodSeconds);
+			this.renderer.render(this.scene, this.camera);
+			ctx.drawImage(export_.canvas, 0, 0, width, height);
+			Animation.stamp(ctx, stamp, width, height, stampRight);
+			const timestamp = Math.round(frame * 1e6 / fps);
+			const duration = frame === frames - 1
+				? Math.max(1, total - timestamp)
+				: Math.round(1e6 / fps);
+			const videoFrame = new VideoFrame(out, { timestamp, duration });
+			encoder.encode(videoFrame, { keyFrame: frame % keyEvery === 0 });
+			videoFrame.close();
+			if (onProgress) onProgress((frame + 1) / frames);
+			// Drain the codec's queue without a timer: a background tab throttles timers, not the encoder.
+			if (encoder.encodeQueueSize > 8)
+				await encoder.flush();
+		}
+		await encoder.flush();
+		if (failure)
+			throw failure;
+		muxer.finalize();
+		return new Blob([target.buffer], { type: mime });
+	} finally {
+		try { encoder.close(); } catch (err) { /* already closed, or the encode failed */ }
+		export_.stop();
+	}
+}
+
+/**
+ * The wall-clock fallback for a browser without WebCodecs. `MediaRecorder` stamps each frame with the
+ * time it arrived, so the clip is as long as the drawing took; this path is for a foreground tab.
+ */
+async recordWithMediaRecorder({ frames, fps, width, height, stamp, stampRight, onProgress })
+{
 	if (typeof MediaRecorder === 'undefined')
-	throw new Error('This browser cannot record video');
+		throw new Error('This browser cannot record video');
 	const type = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4']
-	.find((one) => MediaRecorder.isTypeSupported(one));
+		.find((one) => MediaRecorder.isTypeSupported(one));
 	if (!type) throw new Error('This browser cannot record video');
 
 	const out = document.createElement('canvas');
@@ -2105,22 +2361,23 @@ async recordCycles({ cycles = 2, fps = 30, width = 960, height = 540, stamp = ''
 	const export_ = this.beginExport({ width, height });
 	this.exporting = export_;
 	const perFrame = 1000 / fps;
-	const frames = Math.max(1, Math.round(cycles * this.cycleDuration() / perFrame));
 	const started = performance.now();
 	recorder.start();
 
-	for (let frame = 0; frame < frames; frame++) {
-		this.setTime(frame * perFrame / 1000 * this.options.animationSpeed % this.periodSeconds);
-		this.renderer.render(this.scene, this.camera);
-		ctx.drawImage(export_.canvas, 0, 0, width, height);
-		Animation.stamp(ctx, stamp, width, height, stampRight);
-		if (onProgress) onProgress((frame + 1) / frames);
-		const wait = started + (frame + 1) * perFrame - performance.now();
-		if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+	try {
+		for (let frame = 0; frame < frames; frame++) {
+			this.setTime(frame * perFrame / 1000 * this.options.animationSpeed % this.periodSeconds);
+			this.renderer.render(this.scene, this.camera);
+			ctx.drawImage(export_.canvas, 0, 0, width, height);
+			Animation.stamp(ctx, stamp, width, height, stampRight);
+			if (onProgress) onProgress((frame + 1) / frames);
+			const wait = started + (frame + 1) * perFrame - performance.now();
+			if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+		}
+	} finally {
+		recorder.stop();
+		export_.stop();
 	}
-
-	recorder.stop();
-	export_.stop();
 	return finished;
 }
 
@@ -2160,6 +2417,8 @@ destroy()
 	this.cleanup();
 	if (this.animationFrameRequestId)
 		cancelAnimationFrame(this.animationFrameRequestId);
+	this.animationFrameRequestId = null;
+	this.active = false;
 }
 
 } // end class Animation
