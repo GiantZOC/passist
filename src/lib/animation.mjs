@@ -2300,25 +2300,25 @@ async encodeCycles({ Muxer, Target, mime, container, config, cycles, frames, fps
 
 	const export_ = this.beginExport({ width, height });
 	this.exporting = export_;
-	const perFrame = 1000 / fps;
 	const total = Math.round(cycles * this.cycleDuration() * 1000);
 	const keyEvery = Math.max(1, Math.round(fps * 2));
+	// One extra frame lands on the cycle boundary: WebM takes the last timestamp as the clip's
+	// duration, so without it the file is a frame short, and the boundary frame is also the loop point.
+	const count = frames + 1;
 	try {
-		for (let frame = 0; frame < frames; frame++) {
+		for (let frame = 0; frame < count; frame++) {
 			if (failure)
 				throw failure;
-			this.setTime(frame * perFrame / 1000 * this.options.animationSpeed % this.periodSeconds);
+			const timestamp = Math.round(frame * total / frames);
+			this.setTime(timestamp / 1e6 * this.options.animationSpeed % this.periodSeconds);
 			this.renderer.render(this.scene, this.camera);
 			ctx.drawImage(export_.canvas, 0, 0, width, height);
 			Animation.stamp(ctx, stamp, width, height, stampRight);
-			const timestamp = Math.round(frame * 1e6 / fps);
-			const duration = frame === frames - 1
-				? Math.max(1, total - timestamp)
-				: Math.round(1e6 / fps);
+			const duration = frame === count - 1 ? 0 : Math.round(1e6 / fps);
 			const videoFrame = new VideoFrame(out, { timestamp, duration });
 			encoder.encode(videoFrame, { keyFrame: frame % keyEvery === 0 });
 			videoFrame.close();
-			if (onProgress) onProgress((frame + 1) / frames);
+			if (onProgress) onProgress((frame + 1) / count);
 			// Drain the codec's queue without a timer: a background tab throttles timers, not the encoder.
 			if (encoder.encodeQueueSize > 8)
 				await encoder.flush();
